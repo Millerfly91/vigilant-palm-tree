@@ -4,6 +4,7 @@ import {
   attackWithPlatoon,
   finalizeManualBattle,
   getCombatant,
+  getMeleeApproachHexes,
   getMovementRange,
   getValidAttackTargets,
   getValidMeleeTargets,
@@ -239,6 +240,69 @@ test("spyOnPlatoon: spends 1 troop, reveals one-directionally, and never touches
   const farEnemy = getCombatant(far, "defender", 0)!;
   assert.equal(spyOnPlatoon(far, "attacker", 0, farEnemy.slotIndex, "footman"), false, "target out of spy range must be rejected");
   assert.equal(farActor.entries.find((e) => e.unitTypeId === "footman")?.count, 5);
+});
+
+test("getMeleeApproachHexes: own hex is included, mapped to the edge the adjacent enemy sits on", () => {
+  const attacker = makePlatoons([{ unitTypeId: "footman", count: 5 }]);
+  const defender = makePlatoons([{ unitTypeId: "weak", count: 1 }]);
+  const state = startManualBattle(attacker, defender, { unitTypes, grid: { cols: 3, rows: 1 }, fixedObstacles: [] });
+  const actor = getCombatant(state, "attacker", 0)!;
+  const enemy = getCombatant(state, "defender", 0)!;
+  actor.position = { q: 0, r: 0 };
+  enemy.position = { q: 1, r: 0 }; // EDGE_NEIGHBORS[0] == [1, 0]
+
+  const approach = getMeleeApproachHexes(state, actor);
+  const ownHex = approach.find((a) => a.hex.q === 0 && a.hex.r === 0);
+  assert.ok(ownHex, "own hex should be included since it's adjacent to a living enemy");
+  assert.equal(ownHex!.edgeTargets.get(0), enemy);
+  assert.equal(ownHex!.edgeTargets.size, 1, "only the populated edge should be present, not all 6");
+});
+
+test("getMeleeApproachHexes: two enemies on different sides of the same hex map to their own edge", () => {
+  const attacker = makePlatoons([{ unitTypeId: "footman", count: 5 }]);
+  const defender = makePlatoons([{ unitTypeId: "weak", count: 1 }]);
+  defender[1] = { entries: [{ unitTypeId: "weak", count: 1 }] };
+  const state = startManualBattle(attacker, defender, { unitTypes, grid: { cols: 5, rows: 3 }, fixedObstacles: [] });
+  const actor = getCombatant(state, "attacker", 0)!;
+  const east = getCombatant(state, "defender", 0)!;
+  const southwest = getCombatant(state, "defender", 1)!;
+  actor.position = { q: 2, r: 1 };
+  east.position = { q: 3, r: 1 }; // EDGE_NEIGHBORS[0] == [1, 0]
+  southwest.position = { q: 1, r: 2 }; // EDGE_NEIGHBORS[2] == [-1, 1]
+
+  const approach = getMeleeApproachHexes(state, actor);
+  const ownHex = approach.find((a) => a.hex.q === 2 && a.hex.r === 1)!;
+  assert.equal(ownHex.edgeTargets.get(0), east);
+  assert.equal(ownHex.edgeTargets.get(2), southwest);
+  assert.equal(ownHex.edgeTargets.size, 2);
+});
+
+test("getMeleeApproachHexes: only move-range hexes that actually border a living enemy are included", () => {
+  const attacker = makePlatoons([{ unitTypeId: "footman", count: 5 }]); // speed 3
+  const defender = makePlatoons([{ unitTypeId: "weak", count: 1 }]);
+  const state = startManualBattle(attacker, defender, { unitTypes, grid: { cols: 6, rows: 1 }, fixedObstacles: [] });
+  const actor = getCombatant(state, "attacker", 0)!;
+  const enemy = getCombatant(state, "defender", 0)!;
+  actor.position = { q: 0, r: 0 };
+  enemy.position = { q: 4, r: 0 }; // out of the actor's own adjacency, but adjacent to (3,0)
+
+  const approach = getMeleeApproachHexes(state, actor);
+  assert.equal(approach.length, 1, "only (3,0) borders the enemy; (0,0)/(1,0)/(2,0) don't and should be excluded");
+  assert.equal(approach[0].hex.q, 3);
+  assert.equal(approach[0].hex.r, 0);
+  assert.equal(approach[0].edgeTargets.get(0), enemy);
+});
+
+test("getMeleeApproachHexes: ranged platoons attack via range+LOS, not adjacency, so this always returns []", () => {
+  const attacker = makePlatoons([{ unitTypeId: "bowman", count: 5 }]);
+  const defender = makePlatoons([{ unitTypeId: "weak", count: 1 }]);
+  const state = startManualBattle(attacker, defender, { unitTypes, grid: { cols: 3, rows: 1 }, fixedObstacles: [] });
+  const actor = getCombatant(state, "attacker", 0)!;
+  const enemy = getCombatant(state, "defender", 0)!;
+  actor.position = { q: 0, r: 0 };
+  enemy.position = { q: 1, r: 0 };
+
+  assert.deepEqual(getMeleeApproachHexes(state, actor), []);
 });
 
 test("estimateWinChance: symmetric for identical platoons, skewed toward the stronger one", () => {

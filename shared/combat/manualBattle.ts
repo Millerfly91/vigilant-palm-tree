@@ -8,7 +8,7 @@
 // simple heuristic (see runAiTurn). See feature-plans/CombatResolutionEngine.md
 // for the underlying damage/type-advantage rules this reuses unchanged.
 
-import { type Axial, axialRound, hexDistance } from "../../src/core/hex";
+import { type Axial, axialRound, EDGE_NEIGHBORS, hexDistance } from "../../src/core/hex";
 import type { Platoon, PlatoonEntry, UnitType } from "../../src/state/units";
 import { PLATOON_RETREAT_LOSS, RANGED_ATTACK_RANGE } from "../combatConfig";
 import { applyRetreatLoss } from "./damage";
@@ -266,6 +266,38 @@ export function getValidAttackTargets(state: ManualBattleState, combatant: Comba
   return isRangedPlatoon(combatant, state.unitTypes)
     ? getValidRangedTargets(state, combatant)
     : getValidMeleeTargets(state, combatant);
+}
+
+export interface MeleeApproachHex {
+  hex: Axial;
+  edgeTargets: Map<number, Combatant>;
+}
+
+// For a melee combatant, every hex it could attack from this turn (its
+// current position, plus anywhere in getMovementRange) that borders at
+// least one living enemy — with each such hex's populated edges (0-5,
+// matching EDGE_NEIGHBORS/nearestHexEdge) mapped to the enemy on that side.
+// Drives the directional-attack click/hover UI in manualBattleArena.ts:
+// clicking one of these hexes near a populated edge attacks that enemy
+// (moving there first if it isn't the combatant's current position).
+// Ranged platoons attack via range+LOS, not adjacency, so they have no
+// "side" to pick and always return [].
+export function getMeleeApproachHexes(state: ManualBattleState, combatant: Combatant): MeleeApproachHex[] {
+  if (isRangedPlatoon(combatant, state.unitTypes)) return [];
+  const enemies = livingCombatants(combatantsFor(state, enemySideOf(combatant.side)));
+  const enemyByHex = new Map(enemies.map((e) => [hexKey(e.position), e]));
+  const candidateHexes = [combatant.position, ...getMovementRange(state, combatant)];
+  const result: MeleeApproachHex[] = [];
+  for (const hex of candidateHexes) {
+    const edgeTargets = new Map<number, Combatant>();
+    for (let edge = 0; edge < 6; edge++) {
+      const [dq, dr] = EDGE_NEIGHBORS[edge];
+      const enemy = enemyByHex.get(hexKey({ q: hex.q + dq, r: hex.r + dr }));
+      if (enemy) edgeTargets.set(edge, enemy);
+    }
+    if (edgeTargets.size > 0) result.push({ hex, edgeTargets });
+  }
+  return result;
 }
 
 // One-directional, unlike markContacted: the spying side learns the target,

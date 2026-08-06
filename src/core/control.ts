@@ -1,4 +1,4 @@
-import type { Axial } from "./hex";
+import { EDGE_NEIGHBORS, type Axial } from "./hex";
 import type { CastleLevel } from "../entities/settlement";
 import type { BuildingDef } from "../render/cityBuildingDraw";
 import { computeSettlementBonuses } from "./buildingModifiers";
@@ -14,15 +14,6 @@ export function controlRange(level: CastleLevel, buildings?: BuildingDef[]): num
 export function settlementRateRadius(level: CastleLevel): number {
   return level - 1;
 }
-
-const EDGE_NEIGHBORS: readonly [number, number][] = [
-  [1, 0],
-  [0, 1],
-  [-1, 1],
-  [-1, 0],
-  [0, -1],
-  [1, -1],
-];
 
 export function controlledPositions(
   center: Axial,

@@ -5,7 +5,7 @@
 // the "Test Battle" sandbox (src/views/testBattleSetup.ts) — see that file's
 // header for the scope boundary against the real game's battle flow.
 
-import { axialToPixel, hexCorners, hexDistance, pixelToAxial, type Axial } from "../core/hex";
+import { axialToPixel, hexCorners, hexDistance, nearestHexEdge, pixelToAxial, type Axial } from "../core/hex";
 import { totalHealth } from "../../shared/combat/damage";
 import { SURRENDER_COST_GOLD, SURRENDER_UNIT_VALUE_GOLD } from "../../shared/combatConfig";
 import {
@@ -14,6 +14,7 @@ import {
   endPlatoonTurn,
   finalizeManualBattle,
   getCombatant,
+  getMeleeApproachHexes,
   getMovementRange,
   getValidAttackTargets,
   getValidMeleeTargets,
@@ -30,6 +31,7 @@ import {
   totalUnits,
   unactedLivingSlots,
   type ManualBattleState,
+  type MeleeApproachHex,
   type TimeOfDay,
 } from "../../shared/combat/manualBattle";
 import type { BattleLogEntry, BattleSide, Combatant } from "../../shared/combat/types";
@@ -709,6 +711,15 @@ export function openManualBattleArena(
   let selectedSlot: number | null = null;
   let moveRange: Axial[] = [];
   let attackTargets: Combatant[] = [];
+  // Directional melee targeting: every hex the selected platoon could attack
+  // from this turn (its own hex plus its move range) that borders a living
+  // enemy, each with the enemy on each populated edge (see
+  // getMeleeApproachHexes). hoverHex/hoverEdge track the live mouse-driven
+  // preview of which edge would be attacked; both null when the mouse isn't
+  // over a populated edge of one of these hexes.
+  let attackApproachHexes: MeleeApproachHex[] = [];
+  let hoverHex: Axial | null = null;
+  let hoverEdge: number | null = null;
   // Spy targeting: entered via the Spy button, independent of moveRange/
   // attackTargets so it never disturbs the selected platoon's normal
   // move-or-attack state (see spyOnPlatoon in shared/combat/manualBattle.ts —
@@ -1162,6 +1173,27 @@ export function openManualBattleArena(
       ctx.stroke();
     }
 
+    // Directional-attack preview: only drawn when the hovered edge actually
+    // has a living enemy on it (see hoverHex/hoverEdge, set in the
+    // mousemove handler) — an edge with nothing on it isn't a valid attack
+    // direction, so it gets no preview at all rather than a "this does
+    // nothing" indicator.
+    if (hoverHex && hoverEdge !== null) {
+      const approach = attackApproachHexes.find((a) => a.hex.q === hoverHex!.q && a.hex.r === hoverHex!.r);
+      if (approach?.edgeTargets.has(hoverEdge)) {
+        const { x, y } = toCanvas(hoverHex.q, hoverHex.r);
+        const corners = hexCorners(x, y, HEX_SIZE - 1);
+        const c1 = corners[hoverEdge];
+        const c2 = corners[(hoverEdge + 1) % 6];
+        ctx.beginPath();
+        ctx.moveTo(c1.x, c1.y);
+        ctx.lineTo(c2.x, c2.y);
+        ctx.strokeStyle = "#e05050";
+        ctx.lineWidth = 4;
+        ctx.stroke();
+      }
+    }
+
     // Gold dashed ring — deliberately distinct from the red attack-target
     // ring above, so a Spy-armed click never reads as an attack indicator.
     for (const t of spyTargets) {
@@ -1213,10 +1245,12 @@ export function openManualBattleArena(
       selectedSlot = null;
       moveRange = [];
       attackTargets = [];
+      attackApproachHexes = [];
       infoPopup.hide();
     } else {
       moveRange = getMovementRange(state, combatant);
       attackTargets = getValidAttackTargets(state, combatant);
+      attackApproachHexes = getMeleeApproachHexes(state, combatant);
       showInfoPopupFor(combatant, null);
     }
     refresh();
@@ -1246,6 +1280,7 @@ export function openManualBattleArena(
       selectedSlot = null;
       moveRange = [];
       attackTargets = [];
+      attackApproachHexes = [];
       refresh();
       return;
     }
@@ -1262,12 +1297,14 @@ export function openManualBattleArena(
     }
     moveRange = getMovementRange(state, combatant);
     attackTargets = getValidAttackTargets(state, combatant);
+    attackApproachHexes = getMeleeApproachHexes(state, combatant);
     if (moveRange.length === 0 && attackTargets.length === 0) {
       debugLog(`auto-end turn: ${platoonLabel(humanSide, selectedSlot)} exhausted movement with no attack targets`);
       endPlatoonTurn(state, humanSide, selectedSlot);
       selectedSlot = null;
       moveRange = [];
       attackTargets = [];
+      attackApproachHexes = [];
       const slots = unactedLivingSlots(state, humanSide);
       if (slots.length > 0) {
         focusNextUnactedPlatoon();
@@ -1294,6 +1331,7 @@ export function openManualBattleArena(
     selectedSlot = null;
     moveRange = [];
     attackTargets = [];
+    attackApproachHexes = [];
     infoPopup.hide();
     advanceAi();
   }
@@ -1359,7 +1397,7 @@ export function openManualBattleArena(
     });
   }
 
-  function handleClick(hex: Axial): void {
+  function handleClick(hex: Axial, px: number, py: number): void {
     if (isBattleOver(state)) {
       debugLog(`click ${fmtHex(hex)} -> ignored (battle over)`);
       return;
@@ -1420,6 +1458,51 @@ export function openManualBattleArena(
       return;
     }
 
+    // Directional melee attack: hexes the selected platoon could attack from
+    // this turn (its own hex, or anywhere in its move range) that border a
+    // living enemy. Resolves the same edge the hover preview showed; if that
+    // edge has no enemy on it, this branch does nothing at all — falls
+    // straight through to the plain attack/move/deselect checks below, same
+    // as if the hex weren't in attackApproachHexes. The edge/attack
+    // interception only ever fires on a populated edge, never as a new way
+    // to no-op a click.
+    const approach = attackApproachHexes.find((a) => a.hex.q === hex.q && a.hex.r === hex.r);
+    if (approach) {
+      const { x: cx, y: cy } = axialToPixel(hex.q, hex.r, HEX_SIZE);
+      const edge = nearestHexEdge(cx, cy, px, py);
+      const edgeTarget = approach.edgeTargets.get(edge);
+      if (edgeTarget) {
+        const actorBefore = getCombatant(state, humanSide, selectedSlot);
+        const isCurrentPos = !!actorBefore && actorBefore.position.q === hex.q && actorBefore.position.r === hex.r;
+        if (isCurrentPos) {
+          debugLog(`click ${fmtHex(hex)} -> directional attack (edge ${edge}): ${platoonLabel(humanSide, selectedSlot)} -> ${platoonLabel(edgeTarget.side, edgeTarget.slotIndex)}`);
+          const beforeLog = state.log.length;
+          attackWithPlatoon(state, humanSide, selectedSlot, edgeTarget.slotIndex);
+          logNewBattleEvents(beforeLog);
+          afterPlayerAction();
+          return;
+        }
+        const from = actorBefore ? { ...actorBefore.position } : hex;
+        const distance = hexDistance(from, hex);
+        const moved = movePlatoon(state, humanSide, selectedSlot, hex);
+        if (moved) {
+          recordMove(humanSide, selectedSlot, distance);
+          debugLog(
+            `click ${fmtHex(hex)} -> move+attack (edge ${edge}) ${platoonLabel(humanSide, selectedSlot)}: ${fmtHex(from)} -> ${fmtHex(hex)}`,
+            `then attack ${platoonLabel(edgeTarget.side, edgeTarget.slotIndex)}`,
+          );
+          logMoveStats(`after ${platoonLabel(humanSide, selectedSlot)} move`);
+          const beforeLog = state.log.length;
+          attackWithPlatoon(state, humanSide, selectedSlot, edgeTarget.slotIndex);
+          logNewBattleEvents(beforeLog);
+          afterPlayerAction();
+        } else {
+          debugLog(`click ${fmtHex(hex)} -> move+attack REJECTED by engine for ${platoonLabel(humanSide, selectedSlot)} (was shown in attackApproachHexes)`);
+        }
+        return;
+      }
+    }
+
     const target = attackTargets.find((t) => t.position.q === hex.q && t.position.r === hex.r);
     if (target) {
       debugLog(`click ${fmtHex(hex)} -> attack: ${platoonLabel(humanSide, selectedSlot)} -> ${platoonLabel(target.side, target.slotIndex)}`);
@@ -1457,6 +1540,7 @@ export function openManualBattleArena(
       selectedSlot = null;
       moveRange = [];
       attackTargets = [];
+      attackApproachHexes = [];
       infoPopup.hide();
       refresh();
       return;
@@ -1484,13 +1568,64 @@ export function openManualBattleArena(
     debugLog(`click ${fmtHex(hex)} -> no-op (not a legal move/attack/deselect target for ${platoonLabel(humanSide, selectedSlot)})`);
   }
 
-  canvas.addEventListener("click", (e) => {
+  // Converts a mouse event to world-space coordinates (i.e. the same space
+  // axialToPixel/pixelToAxial operate in, with the canvas's centering offset
+  // removed) — shared by the click and hover handlers below.
+  function eventToWorld(e: MouseEvent): { x: number; y: number } {
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / rect.width;
     const scaleY = canvas.height / rect.height;
-    const x = (e.clientX - rect.left) * scaleX - offsetX;
-    const y = (e.clientY - rect.top) * scaleY - offsetY;
-    handleClick(pixelToAxial(x, y, HEX_SIZE));
+    return {
+      x: (e.clientX - rect.left) * scaleX - offsetX,
+      y: (e.clientY - rect.top) * scaleY - offsetY,
+    };
+  }
+
+  canvas.addEventListener("click", (e) => {
+    const { x, y } = eventToWorld(e);
+    handleClick(pixelToAxial(x, y, HEX_SIZE), x, y);
+  });
+
+  // Live directional-attack preview: as the mouse moves over a hex in
+  // attackApproachHexes, resolve the nearest edge (same math handleClick
+  // uses) and stash it in hoverHex/hoverEdge for draw() to render. Only
+  // triggers a redraw when the hovered hex or edge actually changes, so
+  // idle mouse movement within the same edge doesn't thrash the DOM.
+  canvas.addEventListener("mousemove", (e) => {
+    if (selectedSlot === null || attackApproachHexes.length === 0) {
+      if (hoverHex || hoverEdge !== null) {
+        hoverHex = null;
+        hoverEdge = null;
+        draw();
+      }
+      return;
+    }
+    const { x, y } = eventToWorld(e);
+    const hex = pixelToAxial(x, y, HEX_SIZE);
+    const approach = attackApproachHexes.find((a) => a.hex.q === hex.q && a.hex.r === hex.r);
+    if (!approach) {
+      if (hoverHex || hoverEdge !== null) {
+        hoverHex = null;
+        hoverEdge = null;
+        draw();
+      }
+      return;
+    }
+    const { x: cx, y: cy } = axialToPixel(hex.q, hex.r, HEX_SIZE);
+    const edge = nearestHexEdge(cx, cy, x, y);
+    if (hoverHex?.q !== hex.q || hoverHex?.r !== hex.r || hoverEdge !== edge) {
+      hoverHex = hex;
+      hoverEdge = edge;
+      draw();
+    }
+  });
+
+  canvas.addEventListener("mouseleave", () => {
+    if (hoverHex || hoverEdge !== null) {
+      hoverHex = null;
+      hoverEdge = null;
+      draw();
+    }
   });
 
   function renderSidePanel(): void {
