@@ -17,8 +17,10 @@ Browser (Vite SPA)                                  Express API server
       ├─ src/io/assetApi.ts fetch /api/assets/* ─────►  │       ▼
       │                                                │   postgres (shared
       │   src/state/gameState.ts                      │    "game_db" container,
-      │       │  applyEndOfTurnDetailed()             │    fixed port 5432)
-      │       │  reconcile against server result ◄───┼── server re-applies same
+      │       │  builds/spends locally, then          │    fixed port 5432)
+      │       │  POST /commands (EndTurn) ────────────┼─► server runs the whole
+      │       │  ◄──── authoritative heroes/           │    pipeline itself now
+      │       │        settlements/round/day back      │    (server/app/turnService.ts)
       ▼                                                ▼
    TurnController (client-authoritative reducer)
       │  builds/spends Heroes, Settlements, Charters
@@ -27,7 +29,7 @@ Browser (Vite SPA)                                  Express API server
    src/render/* draws every frame from hex map + Hero entities
 ```
 
-`shared/combat/*` is engine-neutral and used by **both** sides — client drives the "Test Battle" dev arena; server calls `resolveBattle()` inside route handlers against the DB-backed `unit_types` catalog.
+`shared/combat/*` is engine-neutral and used by **both** sides — client drives the "Test Battle" dev arena; server resolves battles via the `ResolveBattle` command (`server/app/commandHandler.ts`), not a dedicated route, against its own DB-backed `unit_types` catalog.
 
 ---
 
@@ -37,7 +39,7 @@ Browser (Vite SPA)                                  Express API server
 |---|---|---|
 | Client | `src/main.ts` | Creates `GameEngine`, runs `init`+`initBackend`, shows home view, kicks off `requestAnimationFrame` loop |
 | API | `server/index.ts` | Express bootstrap, CORS, raw image + JSON parsers, mounts `/api` router on `API_PORT` |
-| API routes | `server/routes.ts` | Games CRUD, tiles, events log, end-turn pipeline, resolve-battle, gold transfer, resource trade; re-runs `applyEndOfTurnDetailed` server-side for drift safety |
+| API routes | `server/routes.ts` | Games CRUD, tiles, events log, lobby claim/start; delegates MoveHero/TransferGold/EndTurn/TradeResources/ResolveBattle/RecruitHero/UpgradeTownHall/SetAutoTrade/ReorderStack/CaptureSettlement to `server/http/routes/commands.ts` (`server/app/commandHandler.ts`) instead of hand-rolled PATCH/POST branches — the old dedicated `resolve-battle`/`trade` routes are deleted |
 
 ---
 
@@ -45,11 +47,13 @@ Browser (Vite SPA)                                  Express API server
 
 | Module | Role | Depends on |
 |---|---|---|
-| `server/db.ts` | `pg.Pool` factory; `initSchema()` applies `schema.sql` + migrations 001–005; `withTransaction()` helper | `pg`, `node:fs`, `node:path` |
+| `server/db.ts` | `pg.Pool` factory; `initSchema()` applies `schema.sql`, then auto-discovers and applies every `*.sql` file in `server/migrations/` (sorted by filename); `withTransaction()` helper | `pg`, `node:fs`, `node:path` |
 | `server/auth.ts` | Email + 6-digit-code auth (SHA-256 hashed codes), bearer-token sessions w/ 30-day TTL, `requireAuth` middleware | `express`, `node:crypto`, `./db` |
 | `server/assetRoutes.ts` | REST for `game_assets`: list, get binary (cache headers), put, delete, batch upload | `express`, `./db` |
 | `server/routes.ts` | Core game API; orchestrates state mutations + combat. Also owns the **lobby** endpoints — `POST /games/:name/lobby/claim` (claim a seat by index + handle; 409 on `lobby_already_started` or `seat_already_claimed`) and `POST /games/:name/lobby/start` — backed by a `lobby` jsonb column (`LobbyState`: `seats`, `humanSlots`, `claimed: Record<seatIndex, { handle, claimedAt }>`, `startedAt`). Runs `validateGameRow` on load paths | `../shared/map/gameMap`, `../shared/rng`, `../src/game/initState`, `../shared/gameState`, `../shared/units`, `../shared/constants`, `../shared/combat/resolveBattle`, `../shared/combat/types`, `../shared/validation/gameIntegrity`, `./assetRoutes`, `./auth` |
-| `server/schema.sql` + `migrations/001..005` | DDL for `games`, `tiles`, `game_events`, `settlement_snapshots`, `resource_transactions`, `game_assets`, `unit_types` + counter columns | — |
+| `server/http/routes/telemetry.ts` | `POST`/`GET /api/games/:name/telemetry` — the dev Network Map's data plane. `Router({ mergeParams: true })` (required for `:name` to reach it), mounted by `routes.ts`. Touches no DB at all | `express`, `@heroes/contracts`, `../../telemetry/presenceRegistry` |
+| `server/telemetry/presenceRegistry.ts` | **In-memory, per-process, non-persisted** client presence for the Network Map: fixed ring of the last 10 samples per player, ~6s staleness expiry checked lazily on read, and a star-topology snapshot builder. Deliberately not a table — it must not survive a restart and never touches `games`. See [network-map.md](./network-map.md) | `@heroes/contracts` |
+| `server/schema.sql` + `migrations/*.sql` | DDL for `games`, `tiles`, `game_events`, `settlement_snapshots`, `resource_transactions`, `game_assets`, `unit_types` + counter columns | — |
 
 ---
 
@@ -97,7 +101,7 @@ Browser (Vite SPA)                                  Express API server
 | `rng.ts` | Global LCG `rng()` — local, deliberately non-deterministic client-only randomness (AI wander, decorative city-grid placement). Re-export shim for `mulberry32(seed)` (definition now lives in `@heroes/engine`) | `@heroes/engine` |
 | `eventBus.ts` | Typed pub/sub singleton (`bus.on`/`emit`/`clear`) | — |
 | `eventRegistry.ts` | `registerAllListeners()` hook (placeholder) | `./eventBus` |
-| `events.ts` | `GameEvent` discriminated union (`state:committed`, `turn:ended`, `phase:changed`, `hero:moved`, `settlement:captured`, `battle:resolved`, economy/morale, calc:vision/control/heroSpeed) | `../../shared/types`, `../state/gameState` |
+| `events.ts` | `GameEvent` discriminated union (`state:committed`, `turn:ended`, `phase:changed`, `hero:moved`, `settlement:captured`, `battle:resolved`, economy/morale, calc:vision/control/heroSpeed, `command:rejected`) | `../../shared/types`, `../state/gameState` |
 | `cityGrid.ts` | Diamond-grid math for city view (`TILE_W=96`, `TILE_D=48`); `cellToScreen`/`screenToCell`, `cellsInDrawOrder` | — |
 | `citySpots.ts` | `generateCitySpots` places 3/6/9 resource veins + mines for 5/10/15 city sizes | `../../shared/types`, `./cityGrid` |
 | `control.ts` | `controlRange`, `settlementRateRadius`, `controlledPositions`, `territoryBoundaryEdges` (edge walk reads `HEX_DIRECTIONS` from `./hex`) | `./hex`, `../../shared/types` |
@@ -153,11 +157,11 @@ Browser (Vite SPA)                                  Express API server
 ### 5.9 `src/io/` — network + dev console
 | Module | Role | Imports |
 |---|---|---|
-| `api.ts` | Typed `fetch` wrappers (`health`, `listGames`, `getGame`, `createGame`, `patchGame`, `logEvent`, `getTiles`, `endTurn`, `spendMovement`, `resolveBattle`, `transferGold`, `tradeResources`) with `apiFetch(url, init, timeoutMs)` + AbortController; re-exports shared types | `../core/hex`, `../map/terrain`, `../map/resourceTiles`, `../state/gameState`, `../../shared/combat/types` |
+| `api.ts` | Typed `fetch` wrappers (`health`, `listGames`, `getGame`, `createGame`, `patchGame`, `logEvent`, `getTiles`, `endTurn`, `spendMovement`, `resolveBattle`, `transferGold`, `tradeResources`, `reportTelemetry`, `getTopology`) with `apiFetch(url, init, timeoutMs)` + AbortController; re-exports shared types | `../core/hex`, `../map/terrain`, `../map/resourceTiles`, `../state/gameState`, `../../shared/combat/types` |
 | `auth.ts` | localStorage-backed auth state (`heroesJs.authToken`/`authEmail`); `requestLoginCode`, `verifyLoginCode`, `checkSession`, `logout`, `authHeader` | `./api` |
 | `assetApi.ts` | `fetchAssetList`, `fetchAssetBlob`, `assetUrl(key)`, `uploadAsset`, `deleteAsset`, `batchUpload` against `/api/assets*` | — |
 | `userGames.ts` | localStorage cache `heroesJs.userGames` (recent games w/ `lastSeenAt`) for home screen | — |
-| `multiplayerSync.ts` | **Polling** multiplayer client (no sockets). `MultiplayerSync.start(gameName, intervalMs = 2000)` polls `api.getGame` on a `setInterval`, hydrates each row and emits `mp:stateChanged` on the bus every tick (carrying `prev`/`next`/`serverActivePlayerId`), plus `mp:turnStarted` when `activePlayerId` changes between polls. Claims seat 0 in memory if the lobby shows it claimed and no local id is set. Singleton via `getMultiplayerSync()`; a failed poll warns and returns rather than stopping the timer | `./api`, `../game/initState`, `../core/eventBus`, `../players/localPlayer` |
+| `multiplayerSync.ts` | **Polling** multiplayer client (no sockets). `MultiplayerSync.start(gameName, intervalMs = 2000)` polls `api.getGame` on a `setInterval`, hydrates each row and emits `mp:stateChanged` on the bus every tick (carrying `prev`/`next`/`serverActivePlayerId`), plus `mp:turnStarted` when `activePlayerId` changes between polls. Claims seat 0 in memory if the lobby shows it claimed and no local id is set. Singleton via `getMultiplayerSync()`; a failed poll warns and returns rather than stopping the timer. Also instruments each poll for the dev Network Map — real RTT around the `fetch`, UTF-8 response byte size, and ok/failed — reporting it to `/api/games/:name/telemetry` and emitting `mp:topologyUpdated` with the aggregated snapshot. That reporting is best-effort: it swallows its own errors and never delays or fails a poll (see [network-map.md](./network-map.md)) | `./api`, `../game/initState`, `../core/eventBus`, `../players/localPlayer` |
 | `debugCommands.ts` | Attaches `window.__gameDebug` for manual poking (`endTurn`, `requestMove`, `enterBattle`, etc.) and exposes `__gameDebug.events` (`subscribe`/`getEntries`/`stats`/`clear`/`setCapacity`) backed by the `EventLog` | `../state/gameState`, `../map/pathfinding`, `../map/terrain`, `../core/hex`, `../debug/eventLog` |
 
 ### 5.10 `src/render/` — drawing pipeline
@@ -185,7 +189,19 @@ Browser (Vite SPA)                                  Express API server
 | `overlays/pathOverlay.ts` | `computeReachableSplit`, `drawPathSegment`, `drawTrail`, `drawPathOverlay` (yellow split-line + dots), `drawMinimapPath` | `../../core/hex`, `../../entities/hero`, `../../map/gameMap`, `../../map/terrain`, `../renderer`, `../minimap`, `../minimapCamera`, `../renderTypes` |
 | `overlays/resourceIcon.ts` | Iterates map resource tiles in vision → `drawResourceIcon` | `../../map/gameMap`, `../../core/hex`, `../sprites`, `../assets` |
 | `overlays/territoryOutline.ts` | `drawTerritoryOutlines` — partitions controlled hexes by nearest owner castle → colored Voronoi-style boundary edges | `../../entities/settlement`, `../../core/control`, `../../core/hex`, `../../state/settings` |
-| `renderer.ts` | **Main per-frame hex renderer:** terrain + decorations + fog + resource icons + castles + territory outlines + path overlay + hover ring + animated heroes; routes to `drawMinimap`; handles `activeCharters`/`validCharterHexes` overlays. Frame-option / minimap-geometry types live in `./renderTypes`; `MinimapCamera` from `./minimapCamera` | `../core/hex`, `./camera`, `../entities/hero`, `./sprites`, `../entities/settlement`, `../map/gameMap`, `../map/terrain`, `./overlays/*`, `./assets`, `./fog`, `./minimap`, `./renderTypes`, `./minimapCamera`, `../state/gameState` |
+| `renderer.ts` | **Main per-frame world map orchestrator.** Exports `MapRenderer` (renamed from `Renderer` 2026-08-18). Owns the camera `save`/`apply`/`restore` and the per-frame painter-call order; delegates every paint call to a per-kind class under `./painter/`. Frame-option / minimap-geometry types live in `./renderTypes`; `MinimapCamera` from `./minimapCamera`. Public surface (`new MapRenderer(ctx, map, camera, sprites, minimapCamera)`, `.draw(hover, heroes, path, castles, opts)`, `.hoverFromScreen(x, y)`, `.map` field) is byte-equivalent to the previous `Renderer` | `../core/hex`, `./camera`, `./sprites`, `../entities/hero`, `../entities/settlement`, `../map/gameMap`, `./assets`, `./fog`, `./minimap`, `./renderTypes`, `./minimapCamera`, `./painter/*` |
+| `painter/BackgroundPainter.ts` | Initial `#0a0a0a` full-viewport fill before any other painter runs | (none) |
+| `painter/HexTerrainPainter.ts` | Per-tile hex fill, terrain decoration (forest/water/desert/mountain glyphs), and per-tile fog overlay when the hex is outside `visible` | `../../core/hex`, `../../map/gameMap`, `../../map/terrain`, `../fog`, `../decorationSeed` |
+| `painter/HexHoverPainter.ts` | Yellow `#ffcc00` outline on the hex under the cursor, vision-gated | `../../core/hex`, `../fog` |
+| `painter/HeroPainter.ts` | Hero sprite (bobbing math, variant branching between `drawHeroSprite`/`drawHorseSprite`), owner color dot, selection ring. Owns the only animation math (`bobAmplitude`/`phase`/`scaleY`) that was inline in `Renderer.draw()` | `../../core/hex`, `../../entities/hero`, `../sprites`, `../assets`, `../fog`, `../renderTypes` |
+| `painter/CastlePainter.ts` | Castle sprite + owner-colored selection border (the dash pattern for unowned castles lives here). Combines the previous inline castle loop + private `drawCastleBorder` helper | `../../core/hex`, `../../entities/settlement`, `../sprites`, `../assets`, `../fog`, `../renderTypes` |
+| `painter/CharterPainter.ts` | `activeCharters` per-charter hex outline + `constructing`-phase inner ring + `validCharterHexes` per-tile dashed outline. Combines the previous private `drawCharterOverlays` + `drawValidCharterHexes` | `../../core/hex`, `../../state/gameState`, `../fog` |
+| `scene/types.ts` | *(Phase 5 Track B, in progress — not wired into the live render path)* `SceneNode` discriminated union (`terrainHex`, `fogHex`, `resourceIcon`, `castle`, `hero`, `cityCell`, `cityBuilding`, `citySkybox`, …) + `WorldPoint`. The eventual shared output type for pure scene builders and a future Canvas2D/WebGL painter | `../map/terrain`, `../map/resourceTiles`, `../entities/hero`, `../state/settings`, `@heroes/contracts` |
+| `scene/sceneBuilder/adventureScene.ts` | `buildAdventureScene()` — faithful pure decomposition of `renderer.ts`'s `Renderer.draw()` into `SceneNode[]`. Takes the same `Hero[]`/`Castle[]`/`GameMap` inputs `Renderer.draw()` takes today, not raw `GameState` | `../../../core/hex`, `../../../map/gameMap`, `../../../entities/hero`, `../../../entities/settlement`, `../../renderTypes`, `../../fog`, `../../overlays/pathOverlay`, `@heroes/engine`, `../types` |
+| `scene/sceneBuilder/cityScene.ts` | `buildCityScene()` — same treatment for `cityRenderer.ts`'s `drawCityView()`. Skybox image loading/caching/parallax stays a future `paint2d` concern; the `citySkybox` node only carries the resolved variant/parallax decision | `@heroes/engine`, `@heroes/contracts`, `../../../core/cityGrid`, `../../../map/resourceTiles`, `../../../state/settings`, `../../buildingStyles`, `../../cityBuildingDraw/primitives`, `../types` |
+| `scene/sceneBuilder/battleScene.ts` | `buildBattleScene()` — same treatment for `manualBattleArena.ts`'s `draw()`/`renderPixelFor()`. Unlike `adventureScene.ts`/`cityScene.ts`, there's no `Hero`-style ticked class resolving animation timing before the builder runs, so it takes an explicit `nowMs` field and resolves moveAnim/impact/floating-text progress itself | `../../../core/hex`, `@heroes/engine`, `../types` |
+| `scene/entityMirror.ts` | `EntityMirror` — the visual `Hero[]`/`Castle[]` tween cache. `bootstrap(state)` hard-resyncs from `GameState`; `applyEvent(event)` handles `HeroMoved` (tween) and `SettlementCaptured` (owner) with every other `EngineEvent` a documented no-op for now; `update(dtMs)` ticks tweens. Meant to replace `GameEngine.ts`'s wholesale rebuild-on-`state:committed` pattern once Track 5.A's event-cursor stream exists — not wired in yet | `../../entities/hero`, `../../entities/settlement`, `@heroes/contracts` |
+| `scene/paint2d/` | `paintScene(ctx, nodes, deps, frame?)` — Canvas2D dispatcher shell for `SceneNode[]`. Currently switches on `node.kind` and dispatches to 28 stub per-kind painters (no Canvas behavior yet); the real 1:1 transcription per kind lands in follow-up commits. The Vite-`?url` seam is enforced here: `paint2d/` declares a `Paint2DDep` interface (`deps.ts`) with four per-kind sprite resolvers (`resolveSpriteForResource/Hero/Building/Castle`) + `SkyboxProvider` + state getters + `colorForOwner`/`battleAccent`/`fontFamily`/`charterStyle`, so the painter never names a key string, never reads `settings()` directly, and never imports `assetDescriptors.ts`/`assets.ts`/`sprites.ts`/`cityRenderer.ts`/`cityBuildingDraw.ts` (the barrel). Color constants live in `colors.ts`; shared geometry helpers (`hexPath`, `diamondPath`) in `geometry.ts`. The boundary is enforced by dependency-cruiser rules `paint2d-cannot-import-asset-descriptors` and `paint2d-cannot-value-import-state`, plus the runtime seam test `test/render/paint2d.seam.test.ts`. Wired into `manualBattleArena` via `arena/paint.ts`'s `paintSceneForArena()` behind the `useSceneBuilder` URL flag (`?paint=scenebuilder`); the orchestrator passes `drawLegacy()` as the fallback so the visual stays byte-identical to pre-CB-4 while every battle-kind painter is still a no-op stub. `Renderer`/`drawCityView` not wired yet | `../types`, `../../../core/hex` (current shell); per-kind bodies will pull from leaf-clean helpers (`../../palettes`, `../../cityBuildingDraw/primitives` + per-style leaves, `../../heroSprites`) — no Vite-`?url` coupling ever reaches the painter |
 
 ### 5.11 `src/managers/` — high-level orchestrators
 | Module | Role | Imports |
@@ -229,12 +245,13 @@ Browser (Vite SPA)                                  Express API server
 | `settingsMenu.ts` | Settings UI: Map Info + Game + Population + Confirmations + Visual sections (sliders → `updateSettings`), Reset, Developer Settings link | `./menu`, `../state/settings`, `./developerSettingsMenu` |
 | `tradeModal.ts` | Move resources between settlements (gold cost, amount cap) | `../state/gameState`, `./menu` |
 | `confirmDialog.ts` | Generic confirm/cancel dialog | `./menu` |
+| `src/screens/shared/toast.ts` | Bottom-right dismissible/auto-expiring toast notifications (`showToast(message, kind, durationMs)`, z-index above every modal). `attachCommandFailureToasts()` — explicit-attach, called once from `GameEngine.initEventListeners()`, mirroring `debug/eventLog.ts`'s `attachEventLog()` convention — subscribes to the bus's `command:rejected` event and shows "`{action}` failed: `{reason}`", so a rejected fire-and-forget turn-hook command (#100) surfaces to the player instead of only a `console.warn` | `../../core/eventBus` |
 
 ### 5.13 `src/game/` — bootstrap + turn wiring
 | Module | Role | Imports |
 |---|---|---|
 | `initState.ts` | `buildInitialGameState` (client-side factory using `generateCastles` + `computeSettlementRates` + city spots), `makeInitialStatePayload` (server DTO), `hydrateGameState(row)` (server→client); re-exports `CASTLE_COUNT_*` | `../state/gameState`, `../state/units`, `../io/api`, `../map/gameMap`, `../map/castlePlacement`, `../entities/settlement`, `../economy/settlementRates`, `../state/playerColors`, `../core/citySpots`, `../core/cityGrid`, `../state/settings` |
-| `turnHooks.ts` | `buildTurnHooks` wires client reducers to API: `onHumanTurnEnd`→`/end-turn`, `onAiMove`→`/spend_movement`, `onBattleResolved`→`/resolve-battle`, `pickAiMove`→`aiBrain`, `logEvent`→`/events` (intercepted by `EventLog.wrapHooks` when a dev console is attached) | `../io/api`, `../state/gameState`, `../state/turnController`, `../ai/aiBrain`, `../map/gameMap`, `../core/hex` |
+| `turnHooks.ts` | `buildTurnHooks` wires client reducers to API: `onHumanTurnEnd`→`/commands` (`EndTurn`), `onAiMove`→`/commands` (`MoveHero`), `onBattleResolved`→`/commands` (`ResolveBattle`), `onTradeResources`/`onRecruitHero`/`onUpgradeTownHall`/`onSetAutoTrade`/`onReorderStack`/`onCaptureSettlement`→`/commands` (fire-and-forget, same pattern as `onAiMove` — but a rejection is no longer silent: `reportCommandFailure` emits `command:rejected` on the bus alongside the existing `console.warn`, surfaced to the player as a toast by `src/screens/shared/toast.ts` (#100)), `pickAiMove`→`aiBrain`, `logEvent`→`/events` (intercepted by `EventLog.wrapHooks` when a dev console is attached) | `../io/api`, `../state/gameState`, `../state/turnController`, `../ai/aiBrain`, `../map/gameMap`, `../core/hex`, `../core/eventBus` |
 
 ### 5.14 `src/debug/` — real-time event log + dev console
 | Module | Role | Imports |
@@ -281,9 +298,9 @@ FLUX-driven sprite generation pipeline (`tools/sprites/flux-*.mjs` for castles, 
 
 - **`core/`** has zero `state/`/`render/`/`views/` deps — pure math + pub/sub. Everything else depends on it.
 - **`shared/`** is the engine-neutral layer both `src/` and `server/` import from. Identity/geometry/building/media types (`Axial`, `CastleLevel`, `BuildingKind`, `GenerationStyle`, `PlayerId`, etc.) live in `shared/types.ts`; `mulberry32` is in `shared/rng.ts`; `WAREHOUSE_RESOURCES` in `shared/constants.ts`; map primitives (`Terrain`, `GameMap`, `placeResourceTiles`) in `shared/map/*`. `shared/combat/*` and `shared/units.ts` are imported by both sides.
-- **`state/gameState.ts`** is the **single source of truth** for game logic; both `turnController.ts` and `server/routes.ts` consume its reducers (drift safety: server re-runs `applyEndOfTurnDetailed`). The server reaches those reducers via the `shared/gameState.ts` stepping-stone barrel rather than reaching into `src/` directly.
+- **`state/gameState.ts`** is the **single source of truth** for game logic client-side; `turnController.ts` consumes its reducers for everything except end-turn, which is now server-authoritative end-to-end (`server/app/turnService.ts` composes `@heroes/engine`'s own `applyEndOfTurnDetailed`/`endTurn`/`advanceRound` against the DB row, not a client-submitted state — closes the settlement-upgrade and population-growth/weekly-upkeep gaps the old client-trusting `/end-turn` route left open; charter advancement is now server-authoritative too, synced into its own `charters` table via `charterRepo`).
 - **`core/eventBus.ts`** is the spine connecting `TurnController` → `GameStateManager` → `ViewManager` → `UIManager`/`Renderer`.
-- **`render/renderer.ts`** is the **only consumer** of `entities/Hero` + `entities/Settlement` for drawing; everything else uses `state/gameState` directly.
+- **`render/renderer.ts` (and its `painter/*` subclasses) is the only consumer** of `entities/Hero` + `entities/Settlement` for drawing; everything else uses `state/gameState` directly.
 - **`shared/combat/*`** is the **only directory imported by both** `server/routes.ts` and `src/views/manualBattleArena.ts`.
 - **`render/assetDescriptors.ts`** is the bridge from Vite-bundled PNGs (`src/resources/*`) to runtime sprite keys; `tools/sprites/validate-assets.mjs` enforces its consistency.
 - **`core/buildingRegistry.ts`** is referenced from both logic (`state/gameState`, `economy/*`) and rendering (`render/cityBuildingDraw`, `views/buildingMenu`) — it's the canonical building definition.

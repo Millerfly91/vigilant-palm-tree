@@ -10,9 +10,6 @@ import {
   captureSettlement as captureSettlementReducer,
   startBattle as startBattleReducer,
   endBattlePhase as endBattlePhaseReducer,
-  endTurn as endTurnReducer,
-  applyEndOfTurn as applyEndOfTurnReducer,
-  advanceRound as advanceRoundReducer,
   reorderStack as reorderStackReducer,
   detectAdjacentEnemy as detectAdjacentEnemyFn,
   transferGold as transferGoldReducer,
@@ -38,6 +35,12 @@ import type { BattleResult } from "@heroes/engine";
 export interface TurnControllerHooks {
   onHumanTurnEnd(state: GameState): Promise<GameState>;
   onAiMove(state: GameState, heroId: HeroId, toTile: { q: number; r: number }): Promise<void>;
+  onHumanMove(
+    state: GameState,
+    heroId: HeroId,
+    toTile: { q: number; r: number },
+    cost: number,
+  ): Promise<void>;
   onBattleResolved(state: GameState): Promise<{ state: GameState; battle: BattleResult | null }>;
   pickAiMove(
     state: GameState,
@@ -46,6 +49,52 @@ export interface TurnControllerHooks {
   logEvent(event: { type: string; payload: Record<string, unknown> }): void;
   getMap(): GameMap;
   rng(): number;
+  // Week 3+ ports (plan/2026-08-16-phase-3-parallel-dev-plan.md): unlike
+  // onHumanTurnEnd/onBattleResolved (awaited -- the server's response IS
+  // the new state), these six are fired-and-forgotten the same way
+  // onAiMove already is. The local @heroes/engine reducer call already
+  // ran and this.state is already updated by the time these are called;
+  // they exist purely so the mutation also persists server-side (closing
+  // exactly the gap this port's PR description documents: any of these
+  // actions performed between commands were previously invisible to
+  // EndTurn's authoritative pipeline and got silently reverted by the
+  // next mergeFromEndTurn). Callers don't await the returned promise or
+  // use its resolved value -- same "client trusts its own local
+  // computation, eventual consistency via sync" philosophy as onAiMove.
+  onTradeResources(
+    actor: number,
+    fromSettlementId: SettlementId,
+    toSettlementId: SettlementId,
+    resource: WarehouseResource,
+    amount: number,
+  ): Promise<void>;
+  onRecruitHero(
+    actor: number,
+    heroName: string,
+    settlementId: SettlementId,
+    horseVariant: HorseVariant,
+  ): Promise<void>;
+  onUpgradeTownHall(actor: number, settlementId: SettlementId, targetLevel: 2 | 3): Promise<void>;
+  onSetAutoTrade(actor: number, settlementId: SettlementId, autoTrade: boolean): Promise<void>;
+  onReorderStack(actor: number, heroId: HeroId, fromIdx: number, toIdx: number): Promise<void>;
+  onCaptureSettlement(actor: number, heroId: HeroId, settlementId: SettlementId): Promise<void>;
+  onTransferGold(
+    actor: number,
+    heroId: HeroId,
+    settlementId: SettlementId,
+    direction: TransferDirection,
+  ): Promise<void>;
+  onStartCharter(
+    actor: number,
+    heroId: HeroId,
+    targetQ: number,
+    targetR: number,
+    settlementName: string,
+  ): Promise<void>;
+  // plan/2026-08-17-issue-88-remaining-command-ports.md Tracks 1/2: same
+  // fire-and-forget shape as the rest of this block.
+  onUpgradeBuilding(actor: number, settlementId: SettlementId, requests: BuildingUpgradeRequest[]): Promise<void>;
+  onUpgradeSettlement(actor: number, settlementId: SettlementId, upgradePopulationGate: number): Promise<void>;
 }
 
 export class TurnController {
@@ -53,6 +102,16 @@ export class TurnController {
   private readonly hooks: TurnControllerHooks;
   private aiAwaitingPersist = false;
   private aiEnding = false;
+  // #114 / plan/2026-08-17-issue-88-remaining-command-ports.md §"Race-avoidance
+  // requirement": the fire-and-forget hook calls below (onRecruitHero,
+  // onUpgradeTownHall, etc.) have no barrier against End Turn racing ahead of
+  // them -- act, then immediately end turn, and the server can hydrate
+  // EndTurn's response from a row that doesn't yet reflect the still-in-flight
+  // mutation, silently discarding it. trackCommand registers each hook
+  // promise here; endCurrentTurn() drains this set before calling
+  // onHumanTurnEnd so a command already in flight is guaranteed to land
+  // server-side first.
+  private readonly pendingCommands = new Set<Promise<void>>();
 
   constructor(initial: GameState, hooks: TurnControllerHooks) {
     this.state = initial;
@@ -61,6 +120,18 @@ export class TurnController {
 
   getState(): GameState {
     return this.state;
+  }
+
+  private trackCommand(promise: Promise<void>, label: string): void {
+    const tracked = promise.catch((e) => {
+      console.warn(`[turnController] ${label} failed:`, e);
+    });
+    this.pendingCommands.add(tracked);
+    void tracked.finally(() => this.pendingCommands.delete(tracked));
+  }
+
+  private async drainPendingCommands(): Promise<void> {
+    await Promise.all(this.pendingCommands);
   }
 
   selectHero(heroId: HeroId): void {
@@ -106,6 +177,7 @@ export class TurnController {
     if (defenderId) {
       this.enterBattle(heroId, defenderId);
     }
+    this.trackCommand(this.hooks.onHumanMove(this.state, heroId, toTile, cost), "onHumanMove");
     return true;
   }
 
@@ -136,6 +208,8 @@ export class TurnController {
         previousOwnerId: result.previousOwnerId,
       },
     });
+    const actor = this.state.heroes[heroId]?.ownerId ?? this.state.activePlayerId;
+    this.trackCommand(this.hooks.onCaptureSettlement(actor, heroId, settlementId), "onCaptureSettlement");
     return true;
   }
 
@@ -165,6 +239,8 @@ export class TurnController {
       type: "transfer_gold",
       payload: { heroId, settlementId, direction, amount },
     });
+    const actor = this.state.heroes[heroId]?.ownerId ?? this.state.activePlayerId;
+    this.trackCommand(this.hooks.onTransferGold(actor, heroId, settlementId, direction), "onTransferGold");
     return { ok: true, reason: "" };
   }
 
@@ -183,6 +259,10 @@ export class TurnController {
       type: "resources_traded",
       payload: { fromId, toId, resource, amount },
     });
+    this.trackCommand(
+      this.hooks.onTradeResources(this.state.activePlayerId, fromId, toId, resource, amount),
+      "onTradeResources",
+    );
     return { ok: true, reason: "" };
   }
 
@@ -198,6 +278,8 @@ export class TurnController {
       type: "stack_reordered",
       payload: { heroId, fromIdx, toIdx },
     });
+    const actor = this.state.heroes[heroId]?.ownerId ?? this.state.activePlayerId;
+    this.trackCommand(this.hooks.onReorderStack(actor, heroId, fromIdx, toIdx), "onReorderStack");
     return { ok: true, reason: "" };
   }
 
@@ -212,6 +294,10 @@ export class TurnController {
       type: "auto_trade_toggled",
       payload: { settlementId, autoTrade },
     });
+    this.trackCommand(
+      this.hooks.onSetAutoTrade(this.state.activePlayerId, settlementId, autoTrade),
+      "onSetAutoTrade",
+    );
     return true;
   }
 
@@ -223,6 +309,10 @@ export class TurnController {
         type: "hero_recruited",
         payload: { heroId: result.hero.id, name: heroName, playerId: this.state.activePlayerId },
       });
+      this.trackCommand(
+        this.hooks.onRecruitHero(this.state.activePlayerId, heroName, settlementId, horseVariant),
+        "onRecruitHero",
+      );
     }
     return result;
   }
@@ -274,6 +364,11 @@ export class TurnController {
       type: "charter_started",
       payload: { heroId, targetQ, targetR, settlementName, charterId: payload.charterId },
     });
+
+    this.trackCommand(
+      this.hooks.onStartCharter(this.state.activePlayerId, heroId, targetQ, targetR, settlementName),
+      "onStartCharter",
+    );
 
     this.advanceAutoTravel();
     return { ok: true };
@@ -384,42 +479,65 @@ export class TurnController {
     this.aiEnding = true;
     try {
       const endedPlayerId = this.state.activePlayerId;
+      const endedRound = this.state.round;
+      const oldPhase = this.state.phase.kind;
+      const stateBeforeEnd = this.state;
+
+      // Drain any still-in-flight command promises (recruit, upgrades,
+      // captures, etc.) before asking the server to end the turn -- closes
+      // the race described on this.pendingCommands's own declaration
+      // comment above. Commands rejected here already warned via
+      // trackCommand's own .catch; this only waits for them to settle, it
+      // doesn't re-surface their errors.
+      await this.drainPendingCommands();
+
+      // Server is now fully authoritative for the whole end-turn pipeline
+      // (production/auto-trade/consumption, the next-player-or-round-wrap
+      // phase transition, and -- when wrapping -- settlement upgrades and
+      // weekly upkeep/population growth). No local
+      // applyEndOfTurnReducer/endTurnReducer/advanceRoundReducer pass
+      // beforehand: this.state going in is exactly what gets sent (just
+      // activePlayerId, via the hook), and what comes back is the full
+      // merged result -- see src/game/turnHooks.ts's onHumanTurnEnd.
+      this.state = await this.hooks.onHumanTurnEnd(this.state);
+
+      // turnHooks.ts's onHumanTurnEnd returns the exact same state
+      // reference, untouched, when it has nothing to do (no game name) or
+      // when the server request itself fails (it catches and
+      // console.warns internally, then returns the state it was given).
+      // Bail out before logging/emitting anything below in that case --
+      // otherwise a failed end-turn request would still tell the event
+      // log and event bus a turn transition happened (and could
+      // re-trigger advanceAutoTravel()) when nothing actually changed
+      // server-side.
+      if (this.state === stateBeforeEnd) return;
+
       this.hooks.logEvent({
         type: "turn_ended",
-        payload: { playerId: endedPlayerId, round: this.state.round },
+        payload: { playerId: endedPlayerId, round: endedRound },
       });
       bus.emit({ type: "turn:ended", playerId: endedPlayerId });
-      const oldPhase = this.state.phase.kind;
-      this.state = applyEndOfTurnReducer(this.state);
-      this.state = endTurnReducer(this.state);
+
       const newPhase = this.state.phase.kind;
       if (oldPhase !== newPhase) {
         bus.emit({ type: "phase:changed", oldPhase, newPhase });
       }
-      this.state = await this.hooks.onHumanTurnEnd(this.state);
+
+      const wrapped = this.state.round > endedRound;
+      if (wrapped) {
+        this.hooks.logEvent({ type: "round_ended", payload: { round: endedRound } });
+        bus.emit({ type: "round:changed", round: this.state.round });
+        bus.emit({ type: "day:changed", day: this.state.day });
+        this.hooks.logEvent({ type: "round_started", payload: { round: this.state.round } });
+      }
 
       if (this.state.phase.kind === "PLAYER_TURN") {
         this.advanceAutoTravel();
       } else if (this.state.phase.kind === "AI_TURN") {
-        bus.emit({ type: "phase:changed", oldPhase: "PLAYER_TURN", newPhase: "AI_TURN" });
         this.hooks.logEvent({
           type: "ai_turn_started",
           payload: { playerId: this.state.activePlayerId, round: this.state.round },
         });
-      } else if (this.state.phase.kind === "ROUND_END") {
-        const endedRound = this.state.round;
-        this.hooks.logEvent({
-          type: "round_ended",
-          payload: { round: endedRound },
-        });
-        this.state = advanceRoundReducer(this.state, settings().populationGrowthRate);
-        bus.emit({ type: "round:changed", round: this.state.round });
-        bus.emit({ type: "day:changed", day: this.state.day });
-        this.hooks.logEvent({
-          type: "round_started",
-          payload: { round: this.state.round },
-        });
-        this.advanceAutoTravel();
       }
     } finally {
       this.aiEnding = false;
@@ -434,6 +552,10 @@ export class TurnController {
       type: "town_hall_upgrade_started",
       payload: { settlementId, targetLevel },
     });
+    this.trackCommand(
+      this.hooks.onUpgradeTownHall(this.state.activePlayerId, settlementId, targetLevel),
+      "onUpgradeTownHall",
+    );
     return { ok: true, reason: "" };
   }
 
@@ -445,6 +567,10 @@ export class TurnController {
       type: "building_upgrade_started",
       payload: { settlementId, requests },
     });
+    this.trackCommand(
+      this.hooks.onUpgradeBuilding(this.state.activePlayerId, settlementId, requests),
+      "onUpgradeBuilding",
+    );
     return { ok: true, reason: "" };
   }
 
@@ -477,6 +603,10 @@ export class TurnController {
       type: "settlement_upgrade_started",
       payload: { settlementId, targetLevel },
     });
+    this.trackCommand(
+      this.hooks.onUpgradeSettlement(this.state.activePlayerId, settlementId, settings().upgradePopulationGate),
+      "onUpgradeSettlement",
+    );
     return { ok: true, reason: "" };
   }
 

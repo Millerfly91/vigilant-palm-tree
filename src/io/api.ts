@@ -1,12 +1,11 @@
-import type { Axial } from "../core/hex";
 import type { Terrain } from "../map/terrain";
 import type { ResourceType } from "../map/resourceTiles";
 import type {
-  GameState,
+  ClientTelemetryReport,
   HeroState,
+  NetworkTopologySnapshot,
   Player,
   SettlementState,
-  WarehouseResource,
 } from "@heroes/contracts";
 
 export type {
@@ -36,6 +35,23 @@ export type Game = {
   players: Player[];
   heroes: Record<string, HeroState>;
   settlements: Record<string, SettlementState>;
+  // Newest game_events.id at the moment this snapshot was read (#146). Only
+  // GET /games/:name returns it; the list route and the command responses
+  // don't, hence optional. String because it's a BIGSERIAL over the wire.
+  last_event_id?: string;
+};
+
+// One row of GET /games/:name/events. Raw DB shape (snake_case, id and
+// actor_seat straight off the row) -- `payload` is the persisted EngineEvent
+// for the 13 EngineEvent kinds and a bespoke audit blob for the legacy
+// turn_ended/round_ended/round_started/ai_turn_started kinds, so it stays
+// unknown here and is narrowed at the point of use.
+export type GameEventRow = {
+  id: string;
+  kind: string;
+  payload: unknown;
+  actor_seat: number | null;
+  created_at: string;
 };
 
 export type TileRow = {
@@ -49,28 +65,7 @@ export type LegacyGamePatch = Partial<
   Pick<Game, "hero_q" | "hero_r" | "turn" | "gold" | "enemy_positions">
 >;
 
-export type SpendMovementAction = {
-  action: "spend_movement";
-  heroId: string;
-  fromTile: Axial;
-  toTile: Axial;
-  cost: number;
-  settlements?: Record<string, SettlementState>;
-};
-
-export type GamePatch = LegacyGamePatch | SpendMovementAction;
-
-export type EndTurnResult = {
-  round: number;
-  activePlayerId: number;
-  players: Player[];
-};
-
-export type ResolveBattleResult = {
-  players: Player[];
-  heroes: Record<string, HeroState>;
-  battle: import("@heroes/engine").BattleResult;
-};
+export type GamePatch = LegacyGamePatch;
 
 const BASE = "/api";
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -120,7 +115,7 @@ async function json<T>(res: Response): Promise<T> {
 async function patchGameImpl(
   name: string,
   patch: GamePatch
-): Promise<Game | HeroState> {
+): Promise<Game> {
   const res = await fetchWithTimeout(
     `${BASE}/games/${encodeURIComponent(name)}`,
     {
@@ -129,9 +124,6 @@ async function patchGameImpl(
       body: JSON.stringify(patch),
     }
   );
-  if ("action" in patch && patch.action === "spend_movement") {
-    return json<HeroState>(res);
-  }
   return json<Game>(res);
 }
 
@@ -181,12 +173,7 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: "{}",
     }).then((r) => json<Game>(r)),
-  patchGame: ((name: string, patch: GamePatch) =>
-    patchGameImpl(name, patch)) as {
-    (name: string, patch: SpendMovementAction): Promise<HeroState>;
-    (name: string, patch: LegacyGamePatch): Promise<Game>;
-    (name: string, patch: GamePatch): Promise<Game | HeroState>;
-  },
+  patchGame: (name: string, patch: GamePatch): Promise<Game> => patchGameImpl(name, patch),
   logEvent: (name: string, kind: string, payload: Record<string, unknown> = {}) =>
     fetchWithTimeout(
       `${BASE}/games/${encodeURIComponent(name)}/events`,
@@ -197,108 +184,33 @@ export const api = {
       },
       5_000
     ).then((r) => json<{ id: number; kind: string }>(r)),
+  // ?after=<cursor> is the event-cursor poll (#146/#145). 0 means "the whole
+  // log"; the server rejects a non-integer cursor with a 400 rather than
+  // silently refetching everything.
+  getEvents: (name: string, after: number) =>
+    fetchWithTimeout(
+      `${BASE}/games/${encodeURIComponent(name)}/events?after=${encodeURIComponent(String(after))}`
+    ).then((r) => json<GameEventRow[]>(r)),
   getTiles: (name: string) =>
     fetchWithTimeout(`${BASE}/games/${encodeURIComponent(name)}/tiles`).then((r) =>
       json<TileRow[]>(r)
     ),
+  // Dev Network Map telemetry (issue #51). Best-effort debug data on a short
+  // timeout: it must never be the reason a poll cycle stalls.
+  reportTelemetry: async (name: string, report: ClientTelemetryReport): Promise<void> => {
+    await fetchWithTimeout(
+      `${BASE}/games/${encodeURIComponent(name)}/telemetry`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(report),
+      },
+      3_000
+    );
+  },
+  getTopology: (name: string) =>
+    fetchWithTimeout(`${BASE}/games/${encodeURIComponent(name)}/telemetry`, {}, 3_000).then((r) =>
+      json<NetworkTopologySnapshot>(r)
+    ),
 };
 
-export async function endTurn(
-  name: string,
-  state: GameState
-): Promise<EndTurnResult> {
-  const res = await fetchWithTimeout(
-    `${BASE}/games/${encodeURIComponent(name)}/end-turn`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ state }),
-    }
-  );
-  return json<EndTurnResult>(res);
-}
-
-export async function spendMovement(
-  name: string,
-  payload: {
-    heroId: string;
-    fromTile: Axial;
-    toTile: Axial;
-    cost: number;
-    settlements?: Record<string, SettlementState>;
-  }
-): Promise<HeroState> {
-  const res = await fetchWithTimeout(
-    `${BASE}/games/${encodeURIComponent(name)}`,
-    {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "spend_movement", ...payload }),
-    }
-  );
-  return json<HeroState>(res);
-}
-
-export async function resolveBattle(
-  name: string,
-  payload: { attackerId: string; defenderId: string; state: GameState }
-): Promise<ResolveBattleResult> {
-  const res = await fetchWithTimeout(
-    `${BASE}/games/${encodeURIComponent(name)}/resolve-battle`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }
-  );
-  return json<ResolveBattleResult>(res);
-}
-
-export type TransferGoldResult = {
-  hero: HeroState;
-  settlement: SettlementState;
-};
-
-export async function transferGold(
-  name: string,
-  payload: {
-    heroId: string;
-    settlementId: string;
-    direction: "deposit" | "withdraw";
-  }
-): Promise<TransferGoldResult> {
-  const res = await fetchWithTimeout(
-    `${BASE}/games/${encodeURIComponent(name)}/transfer`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }
-  );
-  return json<TransferGoldResult>(res);
-}
-
-export type TradeResourcesResult = {
-  from: SettlementState;
-  to: SettlementState;
-};
-
-export async function tradeResources(
-  name: string,
-  payload: {
-    fromSettlementId: string;
-    toSettlementId: string;
-    resource: WarehouseResource;
-    amount: number;
-  }
-): Promise<TradeResourcesResult> {
-  const res = await fetchWithTimeout(
-    `${BASE}/games/${encodeURIComponent(name)}/trade`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }
-  );
-  return json<TradeResourcesResult>(res);
-}

@@ -63,10 +63,10 @@ export function attachDebugApi(engine: AttachDebugApiEngine): void {
         const t = gm.get(newPath[i].q, newPath[i].r);
         const stepCost = t ? (TERRAIN_COST as Record<string, number>)[t] : 1;
         if (!Number.isFinite(stepCost) || stepCost <= 0) break;
-        if (cumulative + stepCost > hero.movementRemaining) break;
+        if (cumulative >= hero.movementRemaining) break;
         cumulative += stepCost;
         reachableIdx = i + 1;
-        actualCost = cumulative;
+        actualCost = Math.min(cumulative, hero.movementRemaining);
       }
       if (reachableIdx === 0) return false;
       const dest = newPath[reachableIdx - 1];
@@ -109,6 +109,41 @@ export function attachDebugApi(engine: AttachDebugApiEngine): void {
         heroes: { ...gs.heroes, [id]: { ...existing, q, r, previousQ: null, previousR: null, previousMovementRemaining: null } },
         dirty: true,
       });
+      return true;
+    },
+
+    // Injects a charter directly into local state for rendering purposes --
+    // the adventure scene's charter overlay only ever reads targetQ/targetR/
+    // phase (see CharterPainter.ts / adventureScene.ts), so this skips the
+    // real startCharter command/reducer/server round-trip entirely rather
+    // than fighting commandHandler.ts's granular-vs-JSONB-storage gate on
+    // StartCharter persistence (server/app/commandHandler.ts's "Source gate
+    // FIRST" comment) for a game that was never migrated to granular tables.
+    debugInjectCharter: (heroId: HeroId, targetQ: number, targetR: number, phase: "traveling" | "constructing", settlementName: string) => {
+      const tc = engine.state.getTurnController();
+      const gs = tc.getState();
+      const hero = gs.heroes[heroId];
+      if (!hero) return false;
+      const charter = {
+        id: `debug-ch-${heroId}`,
+        heroId,
+        ownerId: hero.ownerId,
+        targetQ,
+        targetR,
+        settlementName,
+        phase,
+        daysRemaining: 10, // cosmetic only -- not read by the render path
+        settlementId: `debug-s-${heroId}`,
+        resourceRates: {},
+        foundedOnResource: null,
+        citySpots: [],
+      };
+      engine.state.replaceState({
+        ...gs,
+        activeCharters: [...gs.activeCharters.filter((c: any) => c.heroId !== heroId), charter],
+        dirty: true,
+      });
+      engine.refresh();
       return true;
     },
 

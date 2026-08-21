@@ -10,3 +10,6 @@ export * from "./resources";
 export * from "./units";
 export * from "./settlement";
 export * from "./gameState";
+export * from "./commands";
+export * from "./events";
+export * from "./telemetry";

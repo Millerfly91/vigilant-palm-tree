@@ -129,7 +129,9 @@ Settlements can be upgraded to the next tier through an active construction proc
 - **Settlement info panel:** Upgrade button below the warehouse grid. Shows pre-req status when requirements aren't met, clickable button when ready, progress bar during construction.
 - **Building menu (Town Hall):** Upgrade button appears when clicking the Town Hall building (L1 or L2 only). Shows cost and disables when resources are insufficient.
 
-Source: [`src/state/gameState.ts`](../src/state/gameState.ts) (`startTownHallUpgrade`, `startSettlementUpgrade`, `advanceSettlementUpgrades`), [`src/views/settlementInfoMenu.ts`](../src/views/settlementInfoMenu.ts), [`src/views/buildingMenu.ts`](../src/views/buildingMenu.ts).
+Starting a town-hall upgrade (`UpgradeTownHall`), a building upgrade (`UpgradeBuilding`), or a settlement upgrade (`UpgradeSettlement`) is now a server-authoritative command (`server/app/commandHandler.ts`) — the client's local `@heroes/engine` reducer call applies immediately for responsiveness, then a matching command round-trip (`src/io/commands.ts`, fired from `src/state/turnController.ts` via `src/game/turnHooks.ts`) persists it server-side, the same pattern `StartCharter` uses (see Persistence below). `advanceSettlementUpgrades` (completion, on round wrap) has been server-authoritative since `EndTurn`'s pipeline was ported (`server/app/turnService.ts`).
+
+Source: [`src/state/gameState.ts`](../src/state/gameState.ts) (`startTownHallUpgrade`, `startBuildingUpgrade`, `startSettlementUpgrade`, `advanceSettlementUpgrades`), [`server/app/commandHandler.ts`](../server/app/commandHandler.ts) (`UpgradeTownHall`/`UpgradeBuilding`/`UpgradeSettlement` cases), [`src/views/settlementInfoMenu.ts`](../src/views/settlementInfoMenu.ts), [`src/views/buildingMenu.ts`](../src/views/buildingMenu.ts).
 
 ## Capture
 
@@ -163,7 +165,7 @@ Source: [`src/views/cityView.ts`](../src/views/cityView.ts), [`src/views/buildin
 
 ## Persistence
 
-`activeCharters`, `nextCharterId`, and `nextSettlementId` are stored as part of the `games` JSONB row. No schema change needed — they round-trip through `heroes`/`settlements`/`players` JSONB columns on `POST /api/games/:name/end-turn`.
+`activeCharters`/`nextCharterId`/`nextSettlementId` are all persisted server-side. `server/migrations/009_granular_entities.sql` added a `charters` table plus `games.next_charter_id`/`next_settlement_id` counter columns; `server/persistence/hydrate.ts` reads all three into `GameState` on its granular path, and the `StartCharter` command (`server/app/commandHandler.ts`) writes them via `charterRepo.upsertMany` and `gameRepo.saveHeroesAndSettlements`'s extra param. Charter *founding* is also server-authoritative: `advanceCharters()` runs as part of `EndTurn`'s round-wrap pipeline (`server/app/turnService.ts`), and that command's case syncs the result into `charterRepo`. The hex-by-hex *travel* a "traveling"-phase charter's hero takes toward its target is the one piece still client-only — `TurnController.advanceAutoTravel()`'s loop, not yet ported to its own command.
 
 State types defined in [`src/state/gameState.ts`](../src/state/gameState.ts):
 - `CharterState` — `{ id, heroId, ownerId, targetQ, targetR, settlementName, phase, daysRemaining, settlementId, resourceRates, foundedOnResource, citySpots }`

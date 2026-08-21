@@ -3,9 +3,9 @@ import { SessionManager } from "./SessionManager";
 import { ViewManager } from "./ViewManager";
 import { UIManager } from "./UIManager";
 import { GameMap, type MapSize, MAP_SIZES } from "../map/gameMap";
-import { playerWealth } from "@heroes/engine";
+import { playerWealth, hydrateGameState } from "@heroes/engine";
 import { markSaved } from "../state/gameState";
-import { hydrateGameState, playerHeroId } from "../game/initState";
+import { playerHeroId } from "../game/initState";
 import { CASTLE_COUNT_DEFAULT, defaultCastleSeedFromMapSeed, generateCastles } from "../map/castlePlacement";
 import { loadUnitCatalog } from "../data/unitCatalog";
 import { MAP_SEED } from "@screens/adventure/adventureView";
@@ -76,7 +76,14 @@ export class GameSessionManager {
     if (Number.isInteger(claimedSeat) && claimedSeat >= 0) {
       setInMemoryLocalPlayerId(loaded.name, claimedSeat);
     }
-    getMultiplayerSync().start(loaded.name);
+    // Seed the event-cursor poller from the same response the full hydrate
+    // above came from (#146), so its first poll asks for events *after* this
+    // snapshot instead of replaying the whole log. A row without
+    // last_event_id (POST /games' create response doesn't carry one) starts
+    // unseeded, which makes the poller's first tick do its own full hydrate
+    // and seed from that.
+    const seededCursor = loaded.last_event_id === undefined ? undefined : Number(loaded.last_event_id);
+    getMultiplayerSync().start(loaded.name, { cursor: seededCursor, state: hydrated });
   }
 
   async handleManualSave(): Promise<void> {

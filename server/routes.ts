@@ -3,28 +3,28 @@ import { pool, withTransaction } from "./db";
 import { GameMap, type MapSize } from "@heroes/engine";
 import { mulberry32 } from "@heroes/engine";
 import { makeInitialStatePayload } from "../src/game/initState";
-import { tradeResources as tradeResourcesReducer, applyEndOfTurnDetailed } from "@heroes/engine";
-import { WAREHOUSE_RESOURCES, type AutoTradeTransfer } from "@heroes/contracts";
+import { applyEndOfTurnDetailed } from "@heroes/engine";
+import type { AutoTradeTransfer } from "@heroes/contracts";
 import type { PoolClient } from "pg";
 import type {
   GameState,
   HeroState,
   Player,
   SettlementState,
-  WarehouseResource,
 } from "../src/state/gameState";
-import type { Platoon, UnitType } from "@heroes/engine";
-import { normalizePlatoons } from "@heroes/engine";
-import { resolveBattle as resolveBattleEngine } from "@heroes/engine";
-import type { BattleResult } from "@heroes/engine";
+import type { UnitType } from "@heroes/engine";
 import { assetRouter } from "./assetRoutes";
 import { authRouter } from "./auth";
 import { validateGameRow, isHealthy } from "@heroes/engine";
+import { commandsRouter } from "./http/routes/commands";
+import { telemetryRouter } from "./http/routes/telemetry";
 
 export const router = Router();
 
 router.use("/assets", assetRouter);
 router.use("/auth", authRouter);
+router.use("/games/:name/commands", commandsRouter);
+router.use("/games/:name/telemetry", telemetryRouter);
 
 type EnemyPos = { q: number; r: number };
 type TileRow = {
@@ -166,8 +166,16 @@ router.get("/games", async (_req, res) => {
 });
 
 router.get("/games/:name", async (req, res) => {
-  const r = await pool.query<FullGameRow>(
-    `SELECT ${GAME_COLUMNS} FROM games WHERE name = $1`,
+  // last_event_id is the poll cursor a fresh client load seeds from (#146):
+  // taken in the same statement as the state it labels, so no event can slip
+  // between the snapshot and the cursor. ::text because game_events.id is a
+  // BIGSERIAL -- node-postgres hands int8 back as a string either way, and
+  // the client Number()s it (same reasoning as eventRepo.append's own).
+  const r = await pool.query<FullGameRow & { last_event_id: string }>(
+    `SELECT ${GAME_COLUMNS},
+            COALESCE((SELECT MAX(e.id) FROM game_events e WHERE e.game_id = games.id), 0)::text
+              AS last_event_id
+       FROM games WHERE name = $1`,
     [req.params.name]
   );
   if (r.rowCount === 0) {
@@ -401,84 +409,6 @@ router.post("/games", async (req, res) => {
 router.patch("/games/:name", async (req, res) => {
   const body = req.body ?? {};
 
-  // New action: spend_movement
-  if (body && body.action === "spend_movement") {
-    const { heroId, fromTile, toTile, cost } = body;
-    if (
-      typeof heroId !== "string" ||
-      !fromTile ||
-      typeof fromTile.q !== "number" ||
-      typeof fromTile.r !== "number" ||
-      !toTile ||
-      typeof toTile.q !== "number" ||
-      typeof toTile.r !== "number" ||
-      typeof cost !== "number"
-    ) {
-      res.status(400).json({ error: "invalid spend_movement payload" });
-      return;
-    }
-    try {
-      const result = await withTransaction(async (client) => {
-        const gr = await client.query<FullGameRow>(
-          `SELECT ${GAME_COLUMNS} FROM games WHERE name = $1`,
-          [req.params.name]
-        );
-        if (gr.rowCount === 0) return { status: 404 as const };
-        const row = gr.rows[0];
-        const hero = row.heroes[heroId];
-        if (!hero) return { status: 404 as const, error: "hero not found" };
-        if (hero.q !== fromTile.q || hero.r !== fromTile.r) {
-          return { status: 409 as const, error: "hero not at fromTile" };
-        }
-        if (hero.ownerId !== row.active_player_id) {
-          return { status: 403 as const, error: "forbidden_not_your_turn" };
-        }
-        const updatedHero: HeroState = {
-          ...hero,
-          q: toTile.q,
-          r: toTile.r,
-          movementRemaining: hero.movementRemaining - cost,
-        };
-        const newHeroes = { ...row.heroes, [heroId]: updatedHero };
-        const incomingSettlements = (body && typeof body === "object" && body.settlements) || null;
-        const newSettlements = incomingSettlements ?? row.settlements;
-        await client.query(
-          `UPDATE games SET heroes = $1::jsonb, settlements = $2::jsonb, updated_at = now() WHERE id = $3`,
-          [JSON.stringify(newHeroes), JSON.stringify(newSettlements), row.id]
-        );
-        await client.query(
-          `INSERT INTO game_events (game_id, kind, payload) VALUES ($1, $2, $3::jsonb)`,
-          [
-            row.id,
-            "move_completed",
-            JSON.stringify({ heroId, fromTile, toTile, cost }),
-          ]
-        );
-        return { status: 200 as const, hero: updatedHero };
-      });
-      if (result.status === 404) {
-        if ("error" in result && result.error) {
-          res.status(404).json({ error: result.error });
-        } else {
-          res.status(404).json({ error: "not found" });
-        }
-        return;
-      }
-      if (result.status === 409) {
-        res.status(409).json({ error: result.error });
-        return;
-      }
-      res.json(result.hero);
-    } catch (err) {
-      console.error("[api] PATCH /games/:name spend_movement threw:", err);
-      res.status(500).json({
-        error: "internal",
-        message: err instanceof Error ? err.message : String(err),
-      });
-    }
-    return;
-  }
-
   // Legacy patch behavior
   const { hero_q, hero_r, turn, gold, enemy_positions } = body;
   const sets: string[] = [];
@@ -510,7 +440,7 @@ router.patch("/games/:name", async (req, res) => {
   }
   sets.push("updated_at = now()");
   vals.push(req.params.name);
-  const r = await pool.query<GameRow>(
+  const r = await pool.query<FullGameRow>(
     `UPDATE games SET ${sets.join(", ")} WHERE name = $${i}
      RETURNING ${GAME_COLUMNS}`,
     vals
@@ -553,6 +483,23 @@ router.post("/games/:name/events", async (req, res) => {
 });
 
 router.get("/games/:name/events", async (req, res) => {
+  // ?after=<id> is the poll cursor (game_events.id, BIGSERIAL -- strictly
+  // monotonic per row, so it doubles as a cursor with no separate seq
+  // column needed; see server/migrations/010_event_seq.sql's header).
+  // Defaults to 0 (the whole log) so existing callers with no cursor yet
+  // keep working unchanged. Rejected outright rather than silently ignored
+  // when present but not a valid non-negative integer, so a client bug
+  // (e.g. passing NaN or a stringified object) surfaces immediately
+  // instead of quietly refetching the entire log forever.
+  const afterRaw = req.query.after;
+  let after = 0;
+  if (afterRaw !== undefined) {
+    if (typeof afterRaw !== "string" || !/^\d+$/.test(afterRaw)) {
+      res.status(400).json({ error: "invalid after cursor" });
+      return;
+    }
+    after = Number(afterRaw);
+  }
   const game = await pool.query<{ id: number }>(
     "SELECT id FROM games WHERE name = $1",
     [req.params.name]
@@ -561,9 +508,14 @@ router.get("/games/:name/events", async (req, res) => {
     res.status(404).json({ error: "game not found" });
     return;
   }
+  // A cursor past the end of the log is a normal "nothing new yet" poll
+  // result, not an error -- returns an empty array, not a 404.
+  // actor_seat is returned so the client can skip events its own commands
+  // caused (it already applied them locally) -- the read half of #144's
+  // column, which had a writer but no reader until this cursor sync.
   const r = await pool.query(
-    "SELECT id, kind, payload, created_at FROM game_events WHERE game_id = $1 ORDER BY id ASC",
-    [game.rows[0].id]
+    "SELECT id, kind, payload, actor_seat, created_at FROM game_events WHERE game_id = $1 AND id > $2 ORDER BY id ASC",
+    [game.rows[0].id, after]
   );
   res.json(r.rows);
 });
@@ -632,6 +584,7 @@ router.post("/games/:name/end-turn", async (req, res) => {
         id: p.id,
         faction: p.faction,
         name: p.name,
+        color: p.color,
         heroIds: Array.isArray(p.heroIds) ? [...p.heroIds] : [],
         settlementIds: Array.isArray(p.settlementIds) ? [...p.settlementIds] : [],
       }));
@@ -794,370 +747,10 @@ router.post("/games/:name/end-turn", async (req, res) => {
   }
 });
 
-router.post("/games/:name/resolve-battle", async (req, res) => {
-  const body = req.body ?? {};
-  const { attackerId, defenderId, state } = body;
-  if (
-    typeof attackerId !== "string" ||
-    typeof defenderId !== "string" ||
-    !state ||
-    typeof state !== "object" ||
-    !Array.isArray(state.players) ||
-    typeof state.heroes !== "object"
-  ) {
-    res.status(400).json({ error: "invalid resolve-battle payload" });
-    return;
-  }
-  try {
-    const result = await withTransaction(async (client) => {
-      const gr = await client.query<FullGameRow>(
-        `SELECT ${GAME_COLUMNS} FROM games WHERE name = $1`,
-        [req.params.name]
-      );
-      if (gr.rowCount === 0) return { status: 404 as const };
-      const row = gr.rows[0];
-
-      const attackersHero = row.heroes[attackerId];
-      const defendersHero = row.heroes[defenderId];
-      if (!attackersHero || !defendersHero) {
-        return { status: 404 as const, error: "hero not found" };
-      }
-      if (attackersHero.ownerId !== row.active_player_id) {
-        return { status: 403 as const, error: "forbidden_not_your_turn" };
-      }
-
-      const unitTypesResult = await client.query<UnitTypeRow>(
-        `SELECT id, name, attack, defence, health, speed, description, advantage_type, specialty, specialty_priority FROM unit_types`
-      );
-      const unitTypes: Record<string, UnitType> = {};
-      for (const r of unitTypesResult.rows) {
-        unitTypes[r.id] = {
-          id: r.id,
-          name: r.name,
-          attack: r.attack,
-          defence: r.defence,
-          health: r.health,
-          speed: r.speed,
-          description: r.description,
-          advantageType: r.advantage_type,
-          specialty: r.specialty,
-          specialtyPriority: r.specialty_priority,
-        };
-      }
-
-      const players: Player[] = (state.players as Player[]).map((p) => ({
-        id: p.id,
-        faction: p.faction,
-        name: p.name,
-        heroIds: Array.isArray(p.heroIds) ? [...p.heroIds] : [],
-        settlementIds: Array.isArray(p.settlementIds) ? [...p.settlementIds] : [],
-      }));
-
-      const attackerPlatoons: Platoon[] = normalizePlatoons(attackersHero.stacks);
-      const defenderPlatoons: Platoon[] = normalizePlatoons(defendersHero.stacks);
-
-      const battle: BattleResult = resolveBattleEngine(attackerPlatoons, defenderPlatoons, {
-        obstacleSeed: (row.id * 2654435761 + Date.now()) >>> 0,
-        unitTypes,
-      });
-
-      // Hero entities are never deleted here — a no-retreat loss just empties
-      // their platoons. What happens to a fully-defeated hero (capture,
-      // ransom, etc.) is left to a later phase per
-      // feature-plans/CombatResolutionEngine.md "Out of scope".
-      const lootedGold = battle.defenderOutcome === "lost_all_troops" ? Number(defendersHero.gold) || 0 : 0;
-      const heroes: Record<string, HeroState> = {
-        ...row.heroes,
-        [attackerId]: {
-          ...attackersHero,
-          gold: (Number(attackersHero.gold) || 0) + lootedGold,
-          stacks: battle.attackerPlatoons,
-        },
-        [defenderId]: {
-          ...defendersHero,
-          gold: lootedGold > 0 ? 0 : defendersHero.gold,
-          stacks: battle.defenderPlatoons,
-        },
-      };
-
-      const legacyGold = sumPlayerGold(players, heroes, row.settlements);
-
-      await client.query(
-        `UPDATE games SET
-           players = $1::jsonb,
-           heroes = $2::jsonb,
-           settlements = $3::jsonb,
-           gold = $4,
-           updated_at = now()
-         WHERE id = $5`,
-        [
-          JSON.stringify(players),
-          JSON.stringify(heroes),
-          JSON.stringify(row.settlements),
-          legacyGold,
-          row.id,
-        ]
-      );
-
-      await client.query(
-        `INSERT INTO game_events (game_id, kind, payload) VALUES ($1, $2, $3::jsonb)`,
-        [
-          row.id,
-          "combat_resolved",
-          JSON.stringify({
-            attackerId,
-            defenderId,
-            attackerOwnerId: attackersHero.ownerId,
-            winner: battle.winner,
-            attackerOutcome: battle.attackerOutcome,
-            defenderOutcome: battle.defenderOutcome,
-            rewardGold: lootedGold,
-            rounds: battle.rounds,
-          }),
-        ]
-      );
-
-      return {
-        status: 200 as const,
-        result: { players, heroes, battle },
-      };
-    });
-
-    if (result.status === 404) {
-      if ("error" in result && result.error) {
-        res.status(404).json({ error: result.error });
-      } else {
-        res.status(404).json({ error: "not found" });
-      }
-      return;
-    }
-    res.json(result.result);
-  } catch (err) {
-    console.error("[api] POST /games/:name/resolve-battle threw:", err);
-    res.status(500).json({
-      error: "internal",
-      message: err instanceof Error ? err.message : String(err),
-    });
-  }
-});
-
-router.post("/games/:name/transfer", async (req, res) => {
-  const body = req.body ?? {};
-  const { heroId, settlementId, direction } = body;
-  if (
-    typeof heroId !== "string" ||
-    typeof settlementId !== "string" ||
-    (direction !== "deposit" && direction !== "withdraw")
-  ) {
-    res.status(400).json({ error: "invalid transfer payload" });
-    return;
-  }
-  try {
-    const result = await withTransaction(async (client) => {
-      const gr = await client.query<FullGameRow>(
-        `SELECT ${GAME_COLUMNS} FROM games WHERE name = $1`,
-        [req.params.name]
-      );
-      if (gr.rowCount === 0) return { status: 404 as const };
-      const row = gr.rows[0];
-      const hero = row.heroes[heroId];
-      const settlement = row.settlements[settlementId];
-      if (!hero) return { status: 404 as const, error: "hero not found" };
-      if (!settlement) return { status: 404 as const, error: "settlement not found" };
-      if (hero.ownerId !== row.active_player_id) {
-        return { status: 403 as const, error: "forbidden_not_your_turn" };
-      }
-      if (hero.q !== settlement.q || hero.r !== settlement.r) {
-        return { status: 409 as const, error: "hero_not_at_settlement" };
-      }
-      if (settlement.ownerId === null || settlement.ownerId !== hero.ownerId) {
-        return { status: 409 as const, error: "not_owned_settlement" };
-      }
-
-      const amount =
-        direction === "deposit"
-          ? Number(hero.gold) || 0
-          : Number(settlement.gold) || 0;
-      if (amount <= 0) {
-        return { status: 409 as const, error: "nothing_to_transfer" };
-      }
-
-      const newHeroes: Record<string, HeroState> = {
-        ...row.heroes,
-        [heroId]: direction === "deposit"
-          ? { ...hero, gold: 0 }
-          : { ...hero, gold: (Number(hero.gold) || 0) + amount },
-      };
-      const newSettlements: Record<string, SettlementState> = {
-        ...row.settlements,
-        [settlementId]: direction === "withdraw"
-          ? { ...settlement, gold: 0 }
-          : { ...settlement, gold: (Number(settlement.gold) || 0) + amount },
-      };
-
-      const players: Player[] = row.players.map((p) => ({
-        id: p.id,
-        faction: p.faction,
-        name: p.name,
-        heroIds: Array.isArray(p.heroIds) ? [...p.heroIds] : [],
-        settlementIds: Array.isArray(p.settlementIds) ? [...p.settlementIds] : [],
-      }));
-      const legacyGold = sumPlayerGold(players, newHeroes, newSettlements);
-
-      await client.query(
-        `UPDATE games SET
-           players = $1::jsonb,
-           heroes = $2::jsonb,
-           settlements = $3::jsonb,
-           gold = $4,
-           updated_at = now()
-         WHERE id = $5`,
-        [
-          JSON.stringify(players),
-          JSON.stringify(newHeroes),
-          JSON.stringify(newSettlements),
-          legacyGold,
-          row.id,
-        ]
-      );
-
-      await client.query(
-        `INSERT INTO game_events (game_id, kind, payload) VALUES ($1, $2, $3::jsonb)`,
-        [
-          row.id,
-          "transfer_gold",
-          JSON.stringify({ heroId, settlementId, direction, amount }),
-        ]
-      );
-
-      return {
-        status: 200 as const,
-        result: {
-          hero: newHeroes[heroId],
-          settlement: newSettlements[settlementId],
-        },
-      };
-    });
-
-    if (result.status === 404) {
-      if ("error" in result && result.error) {
-        res.status(404).json({ error: result.error });
-      } else {
-        res.status(404).json({ error: "not found" });
-      }
-      return;
-    }
-    if (result.status === 409) {
-      res.status(409).json({ error: result.error });
-      return;
-    }
-    res.json(result.result);
-  } catch (err) {
-    console.error("[api] POST /games/:name/transfer threw:", err);
-    res.status(500).json({
-      error: "internal",
-      message: err instanceof Error ? err.message : String(err),
-    });
-  }
-});
-
-router.post("/games/:name/trade", async (req, res) => {
-  const body = req.body ?? {};
-  const { fromSettlementId, toSettlementId, resource, amount } = body;
-  const VALID_RESOURCES: WarehouseResource[] = ["wood", "stone", "iron", "arcane"];
-  if (
-    typeof fromSettlementId !== "string" ||
-    typeof toSettlementId !== "string" ||
-    typeof resource !== "string" ||
-    !VALID_RESOURCES.includes(resource as WarehouseResource) ||
-    typeof amount !== "number" ||
-    !Number.isInteger(amount) ||
-    amount <= 0
-  ) {
-    res.status(400).json({ error: "invalid trade payload" });
-    return;
-  }
-  try {
-    const result = await withTransaction(async (client) => {
-      const gr = await client.query<FullGameRow>(
-        `SELECT ${GAME_COLUMNS} FROM games WHERE name = $1`,
-        [req.params.name]
-      );
-      if (gr.rowCount === 0) return { status: 404 as const, error: "game not found" };
-      const row = gr.rows[0];
-
-      const fromSettlement = row.settlements[fromSettlementId];
-      const toSettlement = row.settlements[toSettlementId];
-      if (!fromSettlement || !toSettlement) {
-        return { status: 404 as const, error: "settlement not found" };
-      }
-      if (
-        fromSettlement.ownerId !== row.active_player_id ||
-        toSettlement.ownerId !== row.active_player_id
-      ) {
-        return { status: 403 as const, error: "forbidden_not_your_turn" };
-      }
-
-      const tradeResult = tradeResourcesReducer(
-        { ...row, dirty: false } as GameState,
-        fromSettlementId,
-        toSettlementId,
-        resource as WarehouseResource,
-        amount,
-      );
-      if (!tradeResult.ok) {
-        return { status: 409 as const, error: tradeResult.reason };
-      }
-
-      const newSettlements = tradeResult.state.settlements;
-      const legacyGold = sumPlayerGold(row.players, row.heroes, newSettlements);
-
-      await client.query(
-        `UPDATE games SET
-           settlements = $1::jsonb,
-           gold = $2,
-           updated_at = now()
-         WHERE id = $3`,
-        [
-          JSON.stringify(newSettlements),
-          legacyGold,
-          row.id,
-        ]
-      );
-
-      await client.query(
-        `INSERT INTO game_events (game_id, kind, payload) VALUES ($1, $2, $3::jsonb)`,
-        [
-          row.id,
-          "resources_traded",
-          JSON.stringify({ fromSettlementId, toSettlementId, resource, amount }),
-        ]
-      );
-
-      return {
-        status: 200 as const,
-        result: {
-          from: newSettlements[fromSettlementId],
-          to: newSettlements[toSettlementId],
-        },
-      };
-    });
-
-    if (result.status === 404) {
-      res.status(404).json({ error: result.error });
-      return;
-    }
-    if (result.status === 409) {
-      res.status(409).json({ error: result.error });
-      return;
-    }
-    res.json(result.result);
-  } catch (err) {
-    console.error("[api] POST /games/:name/trade threw:", err);
-    res.status(500).json({
-      error: "internal",
-      message: err instanceof Error ? err.message : String(err),
-    });
-  }
-});
+// POST /games/:name/resolve-battle and POST /games/:name/trade were
+// retired here (Phase 3 Track A Week 3+,
+// plan/2026-08-16-phase-3-parallel-dev-plan.md) -- both are now
+// ResolveBattle/TradeResources on the POST /games/:name/commands bus
+// (server/http/routes/commands.ts, server/app/commandHandler.ts), the
+// same cutover Week 2 already did for spend_movement/transfer/end-turn.
 

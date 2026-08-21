@@ -148,7 +148,7 @@ Entry point: [`src/main.ts`](./src/main.ts:1) wires modules together. There is n
 | `src/entities/` | Domain objects: `hero.ts`, `settlement.ts` (Castle) |
 | `src/map/` | Map generation and traversal: `gameMap.ts`, `terrain.ts`, `pathfinding.ts` (A\* over axial hex grid), `castlePlacement.ts`, `resourceTiles.ts` |
 | `src/resources/` | Static asset images (`castle-l1/l2/l3.png` + `.svg`, resource icons) |
-| `src/render/` | Canvas rendering: `renderer.ts`, `camera.ts` (pan/zoom), `fog.ts`, `sprites.ts` (procedural hero drawers), `heroSprites.ts`, `assets.ts` (sprite provider), `assetSource.ts`, `assetDescriptors.ts`, `overlays/` |
+| `src/render/` | Canvas rendering: `renderer.ts` (now exports `MapRenderer`, an orchestrator that delegates per-frame drawing to `painter/`), `painter/` (per-kind classes: `BackgroundPainter`, `HexTerrainPainter`, `HexHoverPainter`, `HeroPainter`, `CastlePainter`, `CharterPainter`), `decorationSeed.ts` (pure helper used by `HexTerrainPainter`), `camera.ts` (pan/zoom), `fog.ts`, `sprites.ts` (procedural hero drawers), `heroSprites.ts`, `assets.ts` (sprite provider), `assetSource.ts`, `assetDescriptors.ts`, `overlays/`, `scene/` (Phase 5 Track B, in progress: pure `GameState -> SceneNode[]` scene builders + a future Canvas2D painter — not wired into live rendering yet, see `src/render/docs/technical-spec.md` §7) |
 | `src/managers/` | Orchestration between state, views, and I/O: `GameEngine.ts` (composer), `GameStateManager.ts` (state ↔ entities sync), `ViewManager.ts` (renderer + camera + adventure view), `UIManager.ts` (HUD, toolbar, menus, city view), `GameActions.ts` (end turn, save, battle flow), `SessionManager.ts` (game session lifecycle), `GameSessionManager.ts` (save/load orchestration) |
 | `src/state/` | Game state: `gameState.ts` (typed store + all pure reducers including charter settlement logic), `turnController.ts` (turn lifecycle, auto-travel, AI tick), `units.ts`, `playerColors.ts`, `settings.ts` |
 | `src/game/` | Game lifecycle: `initState.ts` (build/hydrate initial state), `turnHooks.ts` |
@@ -157,11 +157,12 @@ Entry point: [`src/main.ts`](./src/main.ts:1) wires modules together. There is n
 | `src/ai/` | AI: `aiBrain.ts` |
 | `src/io/` | External I/O: `api.ts` (typed REST client), `userGames.ts` (local saved-games bookkeeping), `debugCommands.ts` |
 | `src/views/` | DOM UI: `hud.ts`, `toolbar.ts`, `menu.ts`, `heroInfoMenu.ts`, `heroRosterMenu.ts`, `settlementInfoMenu.ts`, `settlementRosterMenu.ts`, `battleModal.ts`, `tradeModal.ts`, `settingsMenu.ts`, `adventureView.ts`, `cityView.ts` |
+| `src/screens/shared/toast.ts` | Bottom-right toast notifications; `attachCommandFailureToasts()` (called once from `GameEngine`) subscribes to the `command:rejected` bus event so a rejected fire-and-forget turn-hook command (`src/game/turnHooks.ts`) surfaces to the player instead of only `console.warn` (#100) |
 | `src/vite-env.d.ts` | Vite type shims |
 
 ### Rendering model
 - Single full-viewport `<canvas>` (`#game`) in `index.html`.
-- `Renderer` paints each frame based on `GameState` and `Camera`.
+- `Renderer` paints each frame based on `GameState` and `Camera`. (In progress, not live yet: `src/render/scene/` is building a pure `SceneNode[]` seam meant to replace this direct coupling — see Phase 5 Track B in the plan docs.)
 - `Camera` supports drag-pan and wheel-zoom (per the `#hud` hint text).
 - Hero/castle sprites are loaded via a `SpriteProvider` (defaults to procedural drawers in `HERO_PROCEDURAL_DRAWERS`); PNGs in `src/resources/` are the static fallback / baked output.
 
@@ -177,8 +178,14 @@ Entry point: [`src/main.ts`](./src/main.ts:1) wires modules together. There is n
 | File | Role |
 |---|---|
 | `server/index.ts` | Express bootstrap, mounts `cors`, `express.json`, `/api` router; calls `initSchema()` before listening |
+| `server/errorHandler.ts` | Global Express error-handling middleware (`ErrorRequestHandler`), registered last in `server/index.ts`'s chain (after the `/api` router). Normalizes any error that reaches it — an unguarded route's thrown/rejected error, an async handler's rejected promise — to the same `{ error: "internal", message }` JSON shape every route with a manual try/catch already returns, instead of Express's default HTML stack-trace page (#98) |
 | `server/db.ts` | `pg.Pool` + `initSchema()` (runs `schema.sql` and any new migrations from `server/migrations/`) |
-| `server/routes.ts` | All HTTP routes under `/api` (game state CRUD, list/create user games, etc.) |
+| `server/routes.ts` | Remaining `/api` routes: games CRUD, tiles, events log, lobby claim/start; mounts `commandsRouter` (below) at `/games/:name/commands` for `MoveHero`/`TransferGold`/`EndTurn`/`TradeResources`/`ResolveBattle`/`RecruitHero`/`UpgradeTownHall`/`SetAutoTrade`/`ReorderStack`/`CaptureSettlement` — the old dedicated `resolve-battle`/`trade` routes are deleted |
+| `server/http/routes/commands.ts` | `POST /games/:name/commands` — `parseCommand()` validates the request body for all 10 command kinds, then dispatches to `handleCommand()`. Lazily awaits + memoizes `createLiveCommandDeps()` on first request rather than at module load, since it's now async |
+| `server/app/commandHandler.ts` | Command-bus core: `handleCommand()` loads the game row, enforces the turn-ownership guard, runs the matching `@heroes/engine` reducer (or `turnService.ts` for `EndTurn`), and persists via `GameRepo`/`EventRepo`. `createLiveCommandDeps()` wires the real Postgres-backed repos below — replaces the now-deleted `server/app/liveRepos.ts` shim; it's async as of `ResolveBattle` (queries the `unit_types` table to populate `ctx.catalog.unitTypes`, previously always empty) |
+| `server/app/turnService.ts` | `runEndTurn()` — server-side EndTurn pipeline (`applyEndOfTurnDetailed` → `endTurn` → `advanceRound`), the same composition `src/state/turnController.ts` used to run client-side |
+| `server/persistence/repositories/gameRepo.ts` | `createGameRepo()` — Postgres-backed `GameRepo` (`load`/`saveHeroesAndSettlements`) used by `commandHandler.ts` |
+| `server/persistence/repositories/eventRepo.ts` | `createEventRepo()` — Postgres-backed `EventRepo.append()`, writes to `game_events` |
 | `server/schema.sql` | Base schema |
 | `server/migrations/001_turn_state.sql` | First migration (turn-state columns/tables) |
 
@@ -187,6 +194,7 @@ API conventions:
 - CORS open (default `cors()` middleware, no origin allowlist configured).
 - No auth layer present in the codebase.
 - Port read from `API_PORT` env var (written by `scripts/allocate-ports.ts` into `.env`), default `3001`.
+- Errors: any error not already caught by a route's own try/catch is normalized to `{ error: "internal", message }` JSON by the global `server/errorHandler.ts` middleware, instead of leaking Express's default HTML/stack-trace error page (#98).
 
 ---
 

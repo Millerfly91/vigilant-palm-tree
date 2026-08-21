@@ -22,6 +22,7 @@ import { registerAllListeners } from "../core/eventRegistry";
 import { attachEventLog, type EventLog } from "../debug/eventLog";
 import { mountPersistentDevConsole, type DevConsoleHandle } from "../debug/devConsole";
 import { getInMemoryLocalPlayerId } from "../players/localPlayer";
+import { attachCommandFailureToasts } from "@screens/shared/toast";
 
 export class GameEngine {
   // Infrastructure
@@ -124,6 +125,11 @@ export class GameEngine {
       getCharterMode: () => this.charterPlacementMode,
       setCharterMode: (v: boolean) => { this.charterPlacementMode = v; if (!v) this.validCharterHexes = null; },
       getValidCharterHexes: () => this.validCharterHexes,
+      onTileInspect: (tile) => {
+        if (this.ui.getCityView()?.isOpen()) return;
+        this.ui.setInspectedTile(tile);
+        this.fullFrame();
+      },
     });
   }
 
@@ -159,6 +165,7 @@ export class GameEngine {
       },
     );
     this.ui.initSettlementInfo();
+    this.ui.initTileInfo();
     this.ui.initCityView(() => this.state, this.view);
   }
 
@@ -195,6 +202,10 @@ export class GameEngine {
       this.state.syncHeroVisualsToState();
       this.fullFrame();
     });
+    // #100: surfaces a toast whenever a fire-and-forget command hook
+    // (src/game/turnHooks.ts) rejects, instead of the previous
+    // console.warn-only silence.
+    attachCommandFailureToasts();
   }
 
   // =========================================================================
@@ -313,6 +324,7 @@ export class GameEngine {
   fullFrame(): void {
     this.draw();
     this.refreshHud();
+    this.ui.setMapDimensions(this.gameMap.width, this.gameMap.height);
   }
 
   refreshToolbarAndFrame(): void {
@@ -354,6 +366,7 @@ export class GameEngine {
         pathReachableIdx: this.state.getPathReachableIdx() ?? undefined,
         pathOrigin: this.state.getPathOrigin() ?? undefined,
         selectedHeroTile: selectedHero ? { q: selectedHero.q, r: selectedHero.r } : undefined,
+        inspectedTile: this.view.getInspectedTile() ?? undefined,
       },
       gs.activeCharters,
       this.validCharterHexes,

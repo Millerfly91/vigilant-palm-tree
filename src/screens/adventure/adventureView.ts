@@ -1,7 +1,7 @@
 import { Axial, axialToPixel } from "../../core/hex";
 import { Camera } from "../../render/camera";
 import { GameMap } from "../../map/gameMap";
-import { Renderer } from "../../render/renderer";
+import { MapRenderer } from "../../render/renderer";
 import { Hero } from "../../entities/hero";
 import { findPath, computePathCost, NEIGHBOR_DIRS } from "../../map/pathfinding";
 import type { GameState, HeroId } from "../../state/gameState";
@@ -9,7 +9,13 @@ import type { TurnController } from "../../state/turnController";
 import { computeReachableSplit } from "../../render/overlays/pathOverlay";
 import type { PathPreviewLock } from "../../managers/GameStateManager";
 import { openCenteredModal, styleButton, styleInput } from "@screens/shared/menu";
-import { MinimapCamera, getMinimapGeometry, isPointInMinimap } from "../../render/minimap";
+import {
+  MinimapCamera,
+  getFovFrameScreenPolygon,
+  getMinimapGeometry,
+  isPointInMinimap,
+  isPointInPolygon,
+} from "../../render/minimap";
 
 export const MAP_SEED = 42;
 
@@ -22,7 +28,7 @@ export interface LastClickDebug {
 
 export interface AdventureViewOptions {
   canvas: HTMLCanvasElement;
-  renderer: Renderer;
+  renderer: MapRenderer;
   map: GameMap;
   camera: Camera;
   minimapCamera: MinimapCamera;
@@ -39,6 +45,7 @@ export interface AdventureViewOptions {
   getCharterMode?: () => boolean;
   setCharterMode?: (v: boolean) => void;
   getValidCharterHexes?: () => Set<string> | null;
+  onTileInspect?: (tile: Axial | null) => void;
 }
 
 const DRAG_MOVE_THRESHOLD = 4;
@@ -65,16 +72,18 @@ function touchAngle(a: Touch, b: Touch): number {
   return Math.atan2(b.clientY - a.clientY, b.clientX - a.clientX);
 }
 
+type MinimapDragTouchState = {
+  id: number;
+  startX: number;
+  startY: number;
+  lastX: number;
+  lastY: number;
+  moved: boolean;
+};
+
 type MinimapTouchState =
-  | {
-      mode: "tap";
-      id: number;
-      startX: number;
-      startY: number;
-      lastX: number;
-      lastY: number;
-      moved: boolean;
-    }
+  | ({ mode: "tap" } & MinimapDragTouchState)
+  | ({ mode: "frameDrag" } & MinimapDragTouchState)
   | {
       mode: "gesture";
       id1: number;
@@ -90,6 +99,8 @@ export class AdventureView {
   hover: Axial | null = null;
   path: Axial[] = [];
   lastClickDebug: LastClickDebug = { hover: null, path: [], reason: "", moved: false };
+
+  private inspectedTile: Axial | null = null;
 
   private dragging = false;
   private movedDuringDrag = false;
@@ -109,6 +120,13 @@ export class AdventureView {
   private minimapDragStartY = 0;
   private minimapLastX = 0;
   private minimapLastY = 0;
+
+  private frameDragging = false;
+  private frameDragMoved = false;
+  private frameDragStartX = 0;
+  private frameDragStartY = 0;
+  private frameLastX = 0;
+  private frameLastY = 0;
 
   private readonly boundMouseUp = () => this.onMouseUp();
   private readonly boundMouseMove = (e: MouseEvent) => this.onMouseMove(e);
@@ -133,10 +151,26 @@ export class AdventureView {
 
   setMap(map: GameMap): void {
     this.opts.map = map;
+    this.setInspectedTile(null);
   }
 
   getPath(): Axial[] {
     return this.path;
+  }
+
+  getInspectedTile(): Axial | null {
+    return this.inspectedTile;
+  }
+
+  clearInspectedTile(): void {
+    this.setInspectedTile(null);
+  }
+
+  private setInspectedTile(tile: Axial | null): void {
+    if (hoverChanged(this.inspectedTile, tile)) {
+      this.inspectedTile = tile;
+      this.opts.onTileInspect?.(tile);
+    }
   }
 
   detach(): void {
@@ -190,8 +224,15 @@ export class AdventureView {
         this.minimapTouch = null;
         return;
       }
+      const framePoly = getFovFrameScreenPolygon(
+        this.opts.camera,
+        this.opts.minimapCamera,
+        geo,
+        window.innerWidth,
+        window.innerHeight,
+      );
       this.minimapTouch = {
-        mode: "tap",
+        mode: isPointInPolygon(t.clientX, t.clientY, framePoly) ? "frameDrag" : "tap",
         id: t.identifier,
         startX: t.clientX,
         startY: t.clientY,
@@ -238,7 +279,7 @@ export class AdventureView {
     const mt = this.minimapTouch;
     if (!mt) return;
 
-    if (mt.mode === "tap") {
+    if (mt.mode === "tap" || mt.mode === "frameDrag") {
       const t = Array.from(e.touches).find((touch) => touch.identifier === mt.id);
       if (!t) return;
       e.preventDefault();
@@ -249,8 +290,12 @@ export class AdventureView {
         mt.moved = true;
       }
 
-      const geo = getMinimapGeometry(this.opts.map);
-      this.opts.minimapCamera.panBy(mt.lastX, mt.lastY, t.clientX, t.clientY, geo, this.opts.map);
+      if (mt.mode === "frameDrag") {
+        this.panMainCameraByFrameDrag(mt.lastX, mt.lastY, t.clientX, t.clientY);
+      } else {
+        const geo = getMinimapGeometry(this.opts.map);
+        this.opts.minimapCamera.panBy(mt.lastX, mt.lastY, t.clientX, t.clientY, geo, this.opts.map);
+      }
       mt.lastX = t.clientX;
       mt.lastY = t.clientY;
       this.opts.onRedraw();
@@ -278,7 +323,7 @@ export class AdventureView {
     const mt = this.minimapTouch;
     if (!mt) return;
 
-    if (mt.mode === "tap" && !mt.moved) {
+    if ((mt.mode === "tap" || mt.mode === "frameDrag") && !mt.moved) {
       const geo = getMinimapGeometry(this.opts.map);
       const world = this.opts.minimapCamera.screenToWorld(mt.startX, mt.startY, geo);
       this.centerOn(world.q, world.r);
@@ -292,7 +337,24 @@ export class AdventureView {
 
   private onMouseDown(e: MouseEvent): void {
     this.movedDuringDrag = false;
-    if (isPointInMinimap(e.clientX, e.clientY, getMinimapGeometry(this.opts.map))) {
+    const minimapGeo = getMinimapGeometry(this.opts.map);
+    if (isPointInMinimap(e.clientX, e.clientY, minimapGeo)) {
+      const framePoly = getFovFrameScreenPolygon(
+        this.opts.camera,
+        this.opts.minimapCamera,
+        minimapGeo,
+        window.innerWidth,
+        window.innerHeight,
+      );
+      if (isPointInPolygon(e.clientX, e.clientY, framePoly)) {
+        this.frameDragging = true;
+        this.frameDragMoved = false;
+        this.frameDragStartX = e.clientX;
+        this.frameDragStartY = e.clientY;
+        this.frameLastX = e.clientX;
+        this.frameLastY = e.clientY;
+        return;
+      }
       this.minimapDragging = true;
       this.minimapDragMoved = false;
       this.minimapDragStartX = e.clientX;
@@ -311,9 +373,34 @@ export class AdventureView {
   private onMouseUp(): void {
     this.dragging = false;
     this.minimapDragging = false;
+    this.frameDragging = false;
+  }
+
+  private panMainCameraByFrameDrag(fromX: number, fromY: number, toX: number, toY: number): void {
+    const geo = getMinimapGeometry(this.opts.map);
+    const before = this.opts.minimapCamera.screenToWorld(fromX, fromY, geo);
+    const after = this.opts.minimapCamera.screenToWorld(toX, toY, geo);
+    const { x: dx, y: dy } = axialToPixel(after.q - before.q, after.r - before.r);
+    const camera = this.opts.camera;
+    camera.x -= dx * camera.zoom;
+    camera.y -= dy * camera.zoom;
   }
 
   private onMouseMove(e: MouseEvent): void {
+    if (this.frameDragging) {
+      this.panMainCameraByFrameDrag(this.frameLastX, this.frameLastY, e.clientX, e.clientY);
+      this.frameLastX = e.clientX;
+      this.frameLastY = e.clientY;
+      if (
+        Math.abs(e.clientX - this.frameDragStartX) + Math.abs(e.clientY - this.frameDragStartY) >
+        DRAG_MOVE_THRESHOLD
+      ) {
+        this.frameDragMoved = true;
+      }
+      this.opts.onRedraw();
+      return;
+    }
+
     if (this.minimapDragging) {
       const geo = getMinimapGeometry(this.opts.map);
       this.opts.minimapCamera.panBy(this.minimapLastX, this.minimapLastY, e.clientX, e.clientY, geo, this.opts.map);
@@ -426,9 +513,10 @@ export class AdventureView {
     const minimapGeo = getMinimapGeometry(this.opts.map);
     const inMinimap = isPointInMinimap(e.clientX, e.clientY, minimapGeo);
     if (inMinimap) {
-      if (this.minimapDragMoved || this.movedDuringDrag) {
+      if (this.minimapDragMoved || this.movedDuringDrag || this.frameDragMoved) {
         this.lastClickDebug.reason = "minimap_drag";
         this.minimapDragMoved = false;
+        this.frameDragMoved = false;
         return;
       }
       const world = this.opts.minimapCamera.screenToWorld(e.clientX, e.clientY, minimapGeo);
@@ -438,15 +526,23 @@ export class AdventureView {
       return;
     }
 
-    if (this.minimapDragMoved) {
+    if (this.minimapDragMoved || this.frameDragMoved) {
       this.lastClickDebug.reason = "minimap_drag";
       this.minimapDragMoved = false;
+      this.frameDragMoved = false;
       return;
     }
 
+    // Resolved once here (rather than separately per branch below) so tile
+    // inspection -- a read-only side effect of the click -- always runs,
+    // including during the AI's turn and inside the charter-placement branch.
+    // A click outside the map (t === null) intentionally leaves the current
+    // inspection alone rather than clearing it.
+    const t = this.opts.renderer.hoverFromScreen(e.clientX, e.clientY);
+    this.lastClickDebug.hover = t;
+    if (t) this.setInspectedTile(t);
+
     if (this.opts.getCharterMode?.() && this.opts.getValidCharterHexes?.()) {
-      const t = this.opts.renderer.hoverFromScreen(e.clientX, e.clientY);
-      this.lastClickDebug.hover = t;
       if (t) {
         const key = `${t.q},${t.r}`;
         const validHexes = this.opts.getValidCharterHexes();
@@ -474,8 +570,6 @@ export class AdventureView {
       this.lastClickDebug.reason = "not_player_turn";
       return;
     }
-    const t = this.opts.renderer.hoverFromScreen(e.clientX, e.clientY);
-    this.lastClickDebug.hover = t;
     if (!t) {
       this.lastClickDebug.reason = "no hover";
       return;
@@ -532,7 +626,10 @@ export class AdventureView {
       if (bestPath && bestPath.length > 0) {
         const reachableIdx = computeReachableSplit(bestPath, this.opts.map, startTile.movementRemaining);
         const clamped = reachableIdx < bestPath.length;
-        const actualCost = computePathCost(this.opts.map, [{ q: startTile.q, r: startTile.r }, ...bestPath.slice(0, reachableIdx)]);
+        const actualCost = Math.min(
+          computePathCost(this.opts.map, [{ q: startTile.q, r: startTile.r }, ...bestPath.slice(0, reachableIdx)]),
+          startTile.movementRemaining,
+        );
         if (reachableIdx > 0) {
           const dest = bestPath[reachableIdx - 1];
           const tc = this.opts.getTurnController();
@@ -589,7 +686,10 @@ export class AdventureView {
     }
     const reachableIdx = computeReachableSplit(newPath, this.opts.map, startTile.movementRemaining);
     const clamped = reachableIdx < newPath.length;
-    const actualCost = computePathCost(this.opts.map, [{ q: startTile.q, r: startTile.r }, ...newPath.slice(0, reachableIdx)]);
+    const actualCost = Math.min(
+      computePathCost(this.opts.map, [{ q: startTile.q, r: startTile.r }, ...newPath.slice(0, reachableIdx)]),
+      startTile.movementRemaining,
+    );
     if (reachableIdx === 0) {
       this.lastClickDebug.reason = "impassable first step";
       return;

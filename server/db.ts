@@ -1,76 +1,23 @@
-import { Pool, type PoolClient } from "pg";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pool } from "./persistence/db";
+
+export { pool, withTransaction } from "./persistence/db";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-export const pool = new Pool({
-  host: process.env.PGHOST ?? "localhost",
-  // The db runs in a single shared docker-compose container on a fixed
-  // host port (see docker-compose.yml), not the per-worktree dynamic
-  // DB_PORT that scripts/ports.ps1 writes to .env - so it's intentionally
-  // not read here. PGPORT remains available as an explicit override.
-  port: Number(process.env.PGPORT ?? 5432),
-  user: process.env.PGUSER || "gameuser",
-  password: process.env.PGPASSWORD || "gamepass",
-  database: process.env.PGDATABASE ?? "game_poc",
-});
 
 export async function initSchema(): Promise<void> {
   const sql = readFileSync(join(__dirname, "schema.sql"), "utf8");
   await pool.query(sql);
-  const migration = readFileSync(
-    join(__dirname, "migrations", "001_turn_state.sql"),
-    "utf8"
-  );
-  await pool.query(migration);
-  const unitTypesMigration = readFileSync(
-    join(__dirname, "migrations", "002_unit_types.sql"),
-    "utf8"
-  );
-  await pool.query(unitTypesMigration);
-  const resourceTablesMigration = readFileSync(
-    join(__dirname, "migrations", "003_resource_tables.sql"),
-    "utf8"
-  );
-  await pool.query(resourceTablesMigration);
-  const assetsMigration = readFileSync(
-    join(__dirname, "migrations", "004_game_assets.sql"),
-    "utf8"
-  );
-  await pool.query(assetsMigration);
-  const unitCountersMigration = readFileSync(
-    join(__dirname, "migrations", "005_unit_counters.sql"),
-    "utf8"
-  );
-  await pool.query(unitCountersMigration);
-  const unitSpecialtyMigration = readFileSync(
-    join(__dirname, "migrations", "007_unit_specialty.sql"),
-    "utf8"
-  );
-  await pool.query(unitSpecialtyMigration);
-  const lobbyMigration = readFileSync(
-    join(__dirname, "migrations", "008_lobby.sql"),
-    "utf8"
-  );
-  await pool.query(lobbyMigration);
-}
 
-export async function withTransaction<T>(
-  fn: (client: PoolClient) => Promise<T>
-): Promise<T> {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const result = await fn(client);
-    await client.query("COMMIT");
-    return result;
-  } catch (err) {
-    console.error("[api] withTransaction rolling back:", err);
-    await client.query("ROLLBACK").catch(() => {});
-    throw err;
-  } finally {
-    client.release();
+  const migrationsDir = join(__dirname, "migrations");
+  const migrationFiles = readdirSync(migrationsDir)
+    .filter((name) => name.endsWith(".sql"))
+    .sort();
+
+  for (const file of migrationFiles) {
+    const migration = readFileSync(join(migrationsDir, file), "utf8");
+    await pool.query(migration);
   }
 }

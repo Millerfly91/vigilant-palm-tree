@@ -33,6 +33,7 @@ A turn-based hex adventure map where the player moves a hero, claims resource ti
 | [architecture.md](./architecture.md) | Executed layout plan that established the current `src/` structure | ✅ Locked |
 | [battle-view-architecture.md](./battle-view-architecture.md) | Battle view surface: trigger → state → UI → server resolver; auto-resolve vs. Test-Battle paths, arena UI, invariants | ✅ Current |
 | [dev-console.md](./dev-console.md) | `src/debug/` event log + modal/footer console for inspecting bus + hook events in real time | 🟡 Open question |
+| [network-map.md](./network-map.md) | Dev overlay showing live client↔API routing topology (RTT, poll-failure rate, throughput); what each metric really measures and why three of four are proxies | ✅ Current |
 | [event-system.md](./event-system.md) | Planned `core/eventBus` refactor and event catalog (Phases 1–6) | 📋 Planned |
 | [module-documentation-and-relationships.md](./module-documentation-and-relationships.md) | **Multiplayer (LAN):** lobby seat claim + `lobby` jsonb column (§3), 2s polling sync (§5.9), lobby UI (§5.12), local seat identity (§5.16) | 🟡 Built, no design doc |
 | [../plan/](../plan/) | Architecture plans: walkthrough + Tailscale, bloat/scalability review, module expansion plan, modal viewport overflow, fight-screen redesign, combat reveal / fog of war | 📋 Planned |
@@ -80,7 +81,7 @@ Full details in the individual docs, but the big ones:
 - **Yield timing:** resources tick per round (all players act, then advanceRound)
 - **Schema anticipates 3 levels** but only Level 1 ships in v1 for player-founded settlements
 - **City view:** double-click settlement → city grid → build mines on resource spots
-- **Combat (current / in progress):** the server runs the **temporary default auto-resolver** at [`packages/engine/src/combat/resolveBattle.ts`](../packages/engine/src/combat/resolveBattle.ts) on `POST /api/games/:name/resolve-battle` when heroes collide on the adventure map. The **tactical (manual) resolver** at [`packages/engine/src/combat/manualBattle.ts`](../packages/engine/src/combat/manualBattle.ts) + [`src/screens/combat/manualBattleArena.ts`](../src/screens/combat/manualBattleArena.ts) is the target and is **in progress** — engine + dev Test Battle arena shipped, adventure-map trigger wiring pending. See [`docs/army.md`](./army.md).
+- **Combat (current / in progress):** the server runs the **temporary default auto-resolver** at [`packages/engine/src/combat/resolveBattle.ts`](../packages/engine/src/combat/resolveBattle.ts) via the `ResolveBattle` command on `POST /api/games/:name/commands` when heroes collide on the adventure map. The **tactical (manual) resolver** at [`packages/engine/src/combat/manualBattle.ts`](../packages/engine/src/combat/manualBattle.ts) + [`src/screens/combat/manualBattleArena.ts`](../src/screens/combat/manualBattleArena.ts) is the target and is **in progress** — engine + dev Test Battle arena shipped, adventure-map trigger wiring pending. See [`docs/army.md`](./army.md).
 - **Recruitment (future):** instant at friendly settlement
 - **Hero death (future):** captured for ransom
 - **Unit cap (future):** base 10 + 1 per owned settlement

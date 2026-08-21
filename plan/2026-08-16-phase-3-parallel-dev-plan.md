@@ -146,6 +146,8 @@ Week 3+:
          is ever more than ~1 port-cycle ahead of Dev A's need for it.
 ```
 
+**Week 3+ status (2026-08-16):** `TradeResources`, `ResolveBattle`, `RecruitHero`, `UpgradeTownHall`, `SetAutoTrade`, `ReorderStack`, and `CaptureSettlement` are done — all seven now round-trip through `POST /games/:name/commands`, and the old dedicated `resolve-battle`/`trade` routes are deleted from `server/routes.ts`. `ResolveBattle`'s obstacle-seed replay gap (§ "What's actually broken today" above) is closed: the seed comes from `ctx.rng()` instead of `Date.now()` and is persisted on the `BattleResolved` event, not just used transiently. `createLiveCommandDeps()` is now async (it queries `unit_types` for `ResolveBattle`'s catalog — previously always empty) and is memoized lazily on first request by `server/http/routes/commands.ts` rather than built at module load. Still deferred, for reasons already on record above rather than new ones: `UpgradeSettlement` (needs `GameMap`+RNG wired into `CommandDeps`, a bigger lift than the pre-agreed repo interface covers), `StartCharter`/`AdvanceCharter` (blocked on the `activeCharters` schema gap — no DB column, and schema changes are Phase 4 per "What this plan does NOT cover" below), `BuildStructure` (still blocked on the missing `@heroes/engine` validate+apply function, Stage 6's deferred item), and lobby claim/start (still last-or-never, unchanged). Also surfaced by this port's own audit, pre-existing and deliberately left alone rather than fixed: human-initiated `MoveHero`/`TransferGold` — unlike the AI-move and `EndTurn` paths, which do round-trip — still have no server call at all. `io/api.ts`'s `spendMovement()`/`transferGold()` exist and work, but neither `src/state/turnController.ts`'s `requestMove()` nor its `transferGold()` method calls them (or any hook) for a human-initiated action; `TurnControllerHooks` has no `onTransferGold`/human-move equivalent today, only `onAiMove`.
+
 ## File ownership table
 
 | Path / Tree | Owner | Notes |
@@ -195,6 +197,15 @@ Week 3+:
 **Risk 4: Dev A blocked on Dev B's real repos.** If Track 3.B's `gameRepo`/`heroRepo`/`settlementRepo` slip past Week 1, Track 3.A's `commandHandler.ts` still has `mockRepos.ts` to develop and test against, per the pre-agreed interface. **Mitigation is structural**, not a fallback plan — this is the entire point of agreeing the interface before either track starts.
 
 **Rollback:** each port is its own PR (one command at a time, per the base plan's own file rule). A bad port rolls back independently; it doesn't take `commandHandler.ts` or any other already-shipped command with it.
+
+## Week 2 follow-ups (#88, #89) — added 2026-08-17
+
+The Week 2 `EndTurn` port (PR #87) was scoped to round-wrap logic and the charter/population-growth gap. Two regressions slipped past because neither was in scope at the time:
+
+- **#88** — recruit/build/upgrade/charter/reorder/auto-trade/capture mutations are discarded on end turn (the legacy `PATCH /games/:name` fallback still ran these; the `EndTurn` command's persistence step never calls `saveHeroesAndSettlements` with the mutation deltas). Higher severity than #89 because the client still holds the values in memory and re-sends.
+- **#89** — `settlement_snapshots` / `resource_transactions` audit rows stopped being written entirely the moment the `EndTurn` command replaced the old `/end-turn` route. The plan's port description never mentioned either table, so the regression went unnoticed for the lifetime of PR #87. Fixed by PR #92 (Track 3.B repo methods on `e955e83`, Track 3.A wiring on `470697f`).
+
+Both must be closed before any Phase 4 rework of `EndTurn`'s persistence step, or that rework will inherit the same audit gap. The Phase 4 `commandHandler.ts` dual-write step (`2026-08-17-consolidated-phase-1-5-track-map.md` §6.1) should treat these as already-closed prior work, not reopen them.
 
 ## What this plan does NOT cover
 
